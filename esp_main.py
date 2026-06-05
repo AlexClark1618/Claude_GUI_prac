@@ -63,16 +63,16 @@ REQUESTED_TIME_WINDOW = 1000000  #returned times (ns) will be within +/- request
 POLL_NAV_CLOCK = b'\xb5\x62\x01\x22\x00\x00\x23\x6a'
 POLL_TIM_SVIN  = b'\xb5\x62\x0d\x04\x00\x00\x11\x40'  # poll survey-in status (TIM-SVIN is pollable on F9)
 
-# CFG-TMODE configuration keys (F9 CFG-VALSET / CFG-VALGET interface).
-# Key ID encodes storage size in bits 28-30: 0x2=1 byte, 0x4=4 bytes.
-CFG_TMODE_MODE           = 0x20030001  # U1: 0=disabled, 1=survey-in, 2=fixed
-CFG_TMODE_POS_TYPE       = 0x20030002  # U1: 0=ECEF, 1=LLH
-CFG_TMODE_ECEF_X         = 0x40030003  # I4 cm
-CFG_TMODE_ECEF_Y         = 0x40030004  # I4 cm
-CFG_TMODE_ECEF_Z         = 0x40030005  # I4 cm
-CFG_TMODE_FIXED_POS_ACC  = 0x4003000f  # U4 0.1 mm
-CFG_TMODE_SVIN_MIN_DUR   = 0x40030010  # U4 s
-CFG_TMODE_SVIN_ACC_LIMIT = 0x40030011  # U4 0.1 mm
+# UBX builders + CFG key constants now live in gps_ubx.py — upload it to the ESP too.
+from gps_ubx import (build_valget, build_svin_cmd, build_fixed_cmd,
+                     build_rst, build_rate_set, POLL_MON_VER, POLL_MON_SYS,
+                     CFG_TMODE_MODE, CFG_TMODE_POS_TYPE,
+                     CFG_TMODE_ECEF_X, CFG_TMODE_ECEF_Y, CFG_TMODE_ECEF_Z,
+                     CFG_TMODE_FIXED_POS_ACC,
+                     CFG_RATE_MEAS, CFG_RATE_NAV, CFG_RATE_TIMEREF, RATE_KEYS)
+
+MON_VER = (10, 0x04)   # b'\x0a\x04' UBX-MON-VER  (version strings)
+MON_SYS = (10, 0x39)   # b'\x0a\x39' UBX-MON-SYS  (CPU/mem/IO load)
 
 numMeas=1
 global tcoll0
@@ -241,85 +241,7 @@ def data_packing(packet_format,v0,v1,v2,v3,v4,v5,v6,v7,v8,v9):
         print("Error in data packing", e)
         return None
 
-# ---------- UBX Message Builder ----------
-def ubx_msg(cls, id_, payload):
-    """Build a complete UBX frame: sync + header + payload + Fletcher checksum."""
-    length = len(payload)
-    CK_A = CK_B = 0
-    for b in (cls, id_, length & 0xFF, (length >> 8) & 0xFF):
-        CK_A = (CK_A + b) & 0xFF
-        CK_B = (CK_B + CK_A) & 0xFF
-    for b in payload:
-        CK_A = (CK_A + b) & 0xFF
-        CK_B = (CK_B + CK_A) & 0xFF
-    msg = bytearray(6 + length + 2)
-    msg[0] = 0xB5; msg[1] = 0x62
-    msg[2] = cls;  msg[3] = id_
-    msg[4] = length & 0xFF; msg[5] = (length >> 8) & 0xFF
-    msg[6:6 + length] = payload
-    msg[6 + length] = CK_A
-    msg[7 + length] = CK_B
-    return msg
-
-def build_valset(items, layers=0x01):
-    """
-    UBX-CFG-VALSET (0x06, 0x8A) – the F9 key-value config interface.
-    items  : list of (key_id, value, size_bytes); size_bytes in {1,2,4,8},
-             value packed little-endian (signed pack is fine for these keys).
-    layers : bitmask 0x01=RAM, 0x02=BBR, 0x04=Flash. RAM gives immediate effect.
-    """
-    payload = bytearray(4)
-    payload[0] = 0x00              # version 0 (no transaction)
-    payload[1] = layers & 0xFF     # config layer(s)
-    # payload[2:4] reserved = 0
-    for key, value, size in items:
-        payload += ustruct.pack('<I', key & 0xFFFFFFFF)
-        if size == 1:
-            payload += ustruct.pack('<b', value)
-        elif size == 2:
-            payload += ustruct.pack('<h', value)
-        elif size == 4:
-            payload += ustruct.pack('<i', value)
-        elif size == 8:
-            payload += ustruct.pack('<q', value)
-    return ubx_msg(0x06, 0x8A, payload)
-
-def build_valget(keys, layer=0x00):
-    """
-    UBX-CFG-VALGET (0x06, 0x8B) request – read config keys back.
-    layer : 0=RAM, 1=BBR, 2=Flash, 7=Default (single layer, not a bitmask).
-    """
-    payload = bytearray(4)
-    payload[0] = 0x00              # version 0 = request
-    payload[1] = layer & 0xFF
-    # payload[2:4] position = 0
-    for key in keys:
-        payload += ustruct.pack('<I', key & 0xFFFFFFFF)
-    return ubx_msg(0x06, 0x8B, payload)
-
-def build_svin_cmd(min_dur_s, acc_01mm):
-    """Put GPS into SURVEY-IN mode via CFG-VALSET (F9 config interface)."""
-    return build_valset([
-        (CFG_TMODE_MODE,           1,         1),   # 1 = survey-in
-        (CFG_TMODE_SVIN_MIN_DUR,   min_dur_s, 4),   # seconds
-        (CFG_TMODE_SVIN_ACC_LIMIT, acc_01mm,  4),   # 0.1 mm
-    ])
-
-def build_fixed_cmd(ecefX_cm, ecefY_cm, ecefZ_cm, acc_01mm):
-    """
-    Put GPS into FIXED ECEF position mode via CFG-VALSET (F9 config interface).
-    ecefX/Y/Z : cm (signed) — same units TIM-SVIN reports its mean in.
-    acc_01mm  : fixed-position accuracy in 0.1 mm.
-    Sub-cm HP components are left unset (cm resolution matches a survey mean).
-    """
-    return build_valset([
-        (CFG_TMODE_MODE,          2,        1),   # 2 = fixed
-        (CFG_TMODE_POS_TYPE,      0,        1),   # 0 = ECEF
-        (CFG_TMODE_ECEF_X,        ecefX_cm, 4),
-        (CFG_TMODE_ECEF_Y,        ecefY_cm, 4),
-        (CFG_TMODE_ECEF_Z,        ecefZ_cm, 4),
-        (CFG_TMODE_FIXED_POS_ACC, acc_01mm, 4),
-    ])
+# (UBX builders moved to gps_ubx.py and imported above)
 
 # ---------- GPS Functions ----------
 junk=bytearray(1024)
@@ -354,11 +276,11 @@ def maxRxBuf(n,n2):
                 readData(1)
                 #uart1.readinto(junk, 1024)
                 #junk=uart1.read(1024)
-            print('buffer cleared of ',nClear, "50ms segments")
+            #print('buffer cleared of ',nClear, "50ms segments")
         elif nbuf > n2:
             readData(1)  #read and parse 1kb segment of raw data
             readData(1)  #read and parse 60byte segment of cal data
-            print('buffer cleared of a 50ms segment')
+            #print('buffer cleared of a 50ms segment')
     except Exception as e:
         print('maxRxbuf exception',e)
         #error_msg = (100, mac_id, 5, 0, 0, 0, 0, 0, 0, 0)
@@ -813,8 +735,8 @@ def readData(det):
             # Payload: version(U1) layer(U1) position(U2), then key/value pairs.
             # Each pair = 4-byte key (LE) + value whose width is encoded in
             # the key's size code (bits 28-30): 0x2->1B, 0x3->2B, 0x4->4B, 0x5->8B.
-            mode = -1; pos_type = 0
-            ecefX = ecefY = ecefZ = 0; fixedPosAcc = 0
+            # Return a generic {key: value} dict — caller picks out TMODE or RATE.
+            cfg = {}
             idx = 4
             while idx + 4 <= leni:
                 key = ustruct.unpack_from('<I', plb, idx)[0]
@@ -827,16 +749,33 @@ def readData(det):
                 else:                     break   # unknown size, stop parsing
                 if idx + vlen > leni:
                     break
-                val = ustruct.unpack_from(fmt, plb, idx)[0]
+                cfg[key] = ustruct.unpack_from(fmt, plb, idx)[0]
                 idx += vlen
+            return ('valget', cfg)
 
-                if   key == CFG_TMODE_MODE:          mode = val
-                elif key == CFG_TMODE_POS_TYPE:      pos_type = val
-                elif key == CFG_TMODE_ECEF_X:        ecefX = val
-                elif key == CFG_TMODE_ECEF_Y:        ecefY = val
-                elif key == CFG_TMODE_ECEF_Z:        ecefZ = val
-                elif key == CFG_TMODE_FIXED_POS_ACC: fixedPosAcc = val
-            return ('tmode3', mode, ecefX, ecefY, ecefZ, fixedPosAcc, pos_type)
+        # ---------- MON-VER (version strings) ----------
+        elif (cls, msg) == MON_VER:
+            # swVersion = char[30] at offset 0, hwVersion = char[10] at offset 30
+            return ('ver', bytes(plb[0:30]))
+
+        # ---------- MON-SYS (CPU / mem / IO load + counts) ----------
+        elif (cls, msg) == MON_SYS:
+            #  2 cpuLoad U1 %   3 cpuLoadMax U1   4 memUsage U1   5 memUsageMax U1
+            #  6 ioUsage U1     7 ioUsageMax U1   8 runTime U4 s
+            # 12 noticeCount U2 14 warnCount U2  16 errorCount U2  18 tempValue I1 °C
+            cpuLoad    = plb[2]
+            cpuLoadMax = plb[3]
+            memUsage   = plb[4]
+            memUsageMax= plb[5]
+            ioUsage    = plb[6]
+            ioUsageMax = plb[7]
+            runTime    = plb[8] | (plb[9] << 8) | (plb[10] << 16) | (plb[11] << 24)
+            notice     = plb[12] | (plb[13] << 8)
+            warn       = plb[14] | (plb[15] << 8)
+            error      = plb[16] | (plb[17] << 8)
+            temp       = ustruct.unpack_from('<b', plb, 18)[0] if leni >= 19 else 0
+            return ('monsys', cpuLoad, cpuLoadMax, memUsage, memUsageMax,
+                    ioUsage, ioUsageMax, runTime, notice, warn, error, temp)
 
         # Yield once after heavy UART work
         time.sleep_ms(0)
@@ -894,13 +833,36 @@ def reconnect_ctrl_socket():
     return cs
 
 def send_ctrl(d):
+    """Send a full control packet. The control socket is non-blocking, so a
+    single .send() may transmit only part of the buffer (or raise EAGAIN) when
+    the TCP send buffer is filling — the old code dropped the remainder, which
+    truncated replies/telemetry (e.g. inst=90 lost right after inst=91). Loop
+    until every byte is out, with a bounded EAGAIN backoff."""
     global ctrl_s
     if d is None:
         return None
     try:
-        return ctrl_s.send(d)
+        mv = memoryview(d)
+        sent = 0
+        retries = 0
+        while sent < len(d):
+            try:
+                n = ctrl_s.send(mv[sent:])
+                if n:
+                    sent += n
+                    retries = 0
+            except OSError as e:
+                if e.args[0] in (11,):       # EAGAIN: send buffer full, wait briefly
+                    retries += 1
+                    if retries > 100:        # ~200 ms cap so we never stall the loop
+                        print("Ctrl send: buffer stuck, dropping packet")
+                        return None
+                    time.sleep_ms(2)
+                    continue
+                raise
+        return sent
     except OSError as e:
-        if e.args[0] in (11, 110):  # EAGAIN / ETIMEDOUT
+        if e.args[0] in (110,):              # ETIMEDOUT
             return None
         print("Ctrl send error:", e)
         ctrl_s = reconnect_ctrl_socket()
@@ -938,24 +900,90 @@ def handle_control(inst, w_num, ms, sub_ms, event_num):
         send_ctrl(data_packing(send_packet_format, 13, mac_id, 0, 0, 0, 0, 0, 0, 0, 0))
 
     elif inst == 14:  # Probe configured fixed-position (CFG-VALGET read-back)
-        clearRxBuf()
-        uart1.write(build_valget([
+        cfg = poll_valget([
             CFG_TMODE_MODE, CFG_TMODE_POS_TYPE,
             CFG_TMODE_ECEF_X, CFG_TMODE_ECEF_Y, CFG_TMODE_ECEF_Z,
-            CFG_TMODE_FIXED_POS_ACC]))
-        tm3_result = None
-        for _ in range(40):
-            res = readData(1)
-            if isinstance(res, tuple) and len(res) == 7 and res[0] == 'tmode3':
-                tm3_result = res
-                break
-        if tm3_result:
-            _, mode, ecefX, ecefY, ecefZ, fixedPosAcc, pos_type = tm3_result
+            CFG_TMODE_FIXED_POS_ACC], CFG_TMODE_MODE)
+        if cfg is not None:
+            mode        = cfg.get(CFG_TMODE_MODE, -1)
+            pos_type    = cfg.get(CFG_TMODE_POS_TYPE, 0)
+            ecefX       = cfg.get(CFG_TMODE_ECEF_X, 0)
+            ecefY       = cfg.get(CFG_TMODE_ECEF_Y, 0)
+            ecefZ       = cfg.get(CFG_TMODE_ECEF_Z, 0)
+            fixedPosAcc = cfg.get(CFG_TMODE_FIXED_POS_ACC, 0)
             send_ctrl(data_packing(send_packet_format, 14, mac_id, mode, pos_type, 0, ecefX, ecefY, ecefZ, fixedPosAcc, 0))
             print("TMODE:", mode, ecefX, ecefY, ecefZ, "acc:", fixedPosAcc, "0.1mm")
         else:
             print("CFG-VALGET (TMODE) poll timed out")
             send_ctrl(data_packing(send_packet_format, 100, mac_id, 18, 0, 0, 0, 0, 0, 0, 0))
+
+    elif inst == 15:  # Restart GPS (w_num=navBbrMask, ms=resetMode). No ACK from receiver.
+        uart1.write(build_rst(w_num, ms))
+        print("GPS restart sent: navBbrMask=", w_num, " resetMode=", ms)
+        send_ctrl(data_packing(send_packet_format, 15, mac_id, 0, 0, 0, 0, 0, 0, 0, 0))
+
+    elif inst == 16:  # Read CFG-RATE (report) via CFG-VALGET
+        cfg = poll_valget(RATE_KEYS, CFG_RATE_MEAS)
+        if cfg is not None:
+            meas_ms = cfg.get(CFG_RATE_MEAS, 0)
+            nav     = cfg.get(CFG_RATE_NAV, 0)
+            timeref = cfg.get(CFG_RATE_TIMEREF, 0)
+            # inst=16, id, RF=timeref, Cal=0, ch=0, w_num=meas_ms, ms=nav, ...
+            send_ctrl(data_packing(send_packet_format, 16, mac_id, timeref, 0, 0, meas_ms, nav, 0, 0, 0))
+            print("RATE: meas=", meas_ms, "ms  nav=", nav, "  timeref=", timeref)
+        else:
+            print("CFG-VALGET (RATE) poll timed out")
+            send_ctrl(data_packing(send_packet_format, 100, mac_id, 19, 0, 0, 0, 0, 0, 0, 0))
+
+    elif inst == 17:  # Set CFG-RATE (w_num=meas_ms, ms=nav_cycles, sub_ms=timeref; <=0 / <0 = skip)
+        cmd = build_rate_set(w_num, ms, sub_ms)
+        if cmd is not None:
+            uart1.write(cmd)
+            print("RATE set: meas=", w_num, "ms  nav=", ms, "  timeref=", sub_ms)
+        send_ctrl(data_packing(send_packet_format, 17, mac_id, 0, 0, 0, 0, 0, 0, 0, 0))
+
+    elif inst == 18:  # GPS comms test — return MON-VER swVersion (up to 32 chars packed into 8 ints)
+        clearRxBuf()
+        uart1.write(POLL_MON_VER)
+        sw = None
+        for _ in range(40):
+            res = readData(1)
+            if isinstance(res, tuple) and len(res) == 2 and res[0] == 'ver':
+                sw = res[1]
+                break
+        if sw is not None:
+            sw = bytes(sw)[:32]
+            sw = sw + b'\x00' * (32 - len(sw))
+            vi = ustruct.unpack('!8i', sw)   # 32 bytes -> 8 ints (round-trips on the GUI)
+            send_ctrl(data_packing(send_packet_format, 18, mac_id,
+                                   vi[0], vi[1], vi[2], vi[3], vi[4], vi[5], vi[6], vi[7]))
+            print("MON-VER:", sw)
+        else:
+            print("MON-VER poll timed out")
+            send_ctrl(data_packing(send_packet_format, 100, mac_id, 20, 0, 0, 0, 0, 0, 0, 0))
+
+def poll_mon_sys():
+    """Poll MON-SYS and return ('monsys', cpuLoad, cpuLoadMax, memUsage,
+    ioUsage, runTime, temp) or None. Does NOT clear the UART — frames read
+    while waiting are still parsed into the ring buffers (no data dropped)."""
+    uart1.write(POLL_MON_SYS)
+    for _ in range(40):
+        res = readData(1)
+        if isinstance(res, tuple) and res and res[0] == 'monsys':
+            return res
+    return None
+
+def poll_valget(keys, marker_key):
+    """Send a CFG-VALGET for `keys` and return the {key:value} dict once a
+    response containing `marker_key` arrives (or None on timeout). Clears the
+    UART first, so it briefly interrupts data collection."""
+    clearRxBuf()
+    uart1.write(build_valget(keys))
+    for _ in range(40):
+        res = readData(1)
+        if isinstance(res, tuple) and len(res) == 2 and res[0] == 'valget' and marker_key in res[1]:
+            return res[1]
+    return None
 
 def service_control():
     """Poll the control socket and run any pending command NOW. Cheap when idle
@@ -1005,6 +1033,8 @@ ctrl_poller = select.poll()
 ctrl_poller.register(ctrl_s, select.POLLIN)
 # Announce mac_id so the server maps this control socket to this ESP
 send_ctrl(data_packing(send_packet_format, 1, mac_id, ip_last_byte, int(detector_num), 0, 0, 0, 0, 0, 0))
+
+cpu_T0 = time.ticks_ms()   # 60 s timer for autonomous GPS CPU telemetry (MON-SYS)
 
 # ---------- Main Loop ----------
 
@@ -1136,6 +1166,22 @@ while True:
 
         service_control()   # check for slow-control commands even when idle
 
+        # Autonomous GPS CPU/health telemetry once a minute (sent on the control channel)
+        if time.ticks_diff(time.ticks_ms(), cpu_T0) > 60000:
+            cpu_T0 = time.ticks_ms()
+            cpu = poll_mon_sys()
+            if cpu:
+                (_, cpuLoad, cpuLoadMax, memUsage, memUsageMax,
+                 ioUsage, ioUsageMax, runTime, notice, warn, error, temp) = cpu
+                # inst=91 (counts) first so the server has them when inst=90 arrives
+                send_ctrl(data_packing(send_packet_format, 91, mac_id,
+                                       notice, warn, error, 0, 0, 0, 0, 0))
+                # inst=90 main: RF=cpuLoad Cal=memUsage ch=ioUsage w_num=temp
+                #               ms=cpuLoadMax sub_ms=memUsageMax event_num=ioUsageMax count=runTime
+                send_ctrl(data_packing(send_packet_format, 90, mac_id,
+                                       cpuLoad, memUsage, ioUsage, temp,
+                                       cpuLoadMax, memUsageMax, ioUsageMax, runTime))
+
         buf_size = uart1.any()
         if uart1.any()>22000:
             print("Buffer Overload")
@@ -1178,7 +1224,7 @@ while True:
                 #timeStamp=rtc_to_gps_wno_ms_subms()
                 try:
                     inst, w_num, ms, sub_ms, event_num = ustruct.unpack(request_packet_format, recv_packet) 
-                    #print(event_num)
+                    print('Request', inst, w_num, ms, sub_ms, event_num)
                 
                     req_diff = ms -prev_req
                     prev_req = ms
@@ -1260,67 +1306,8 @@ while True:
                             #print("!!!!!!!!!!!!!!!!!!!!!data sent", data)
                         send_buffer_index = 0
 
-                elif inst == 11:  # Survey-in status query from server/GUI
-                    clearRxBuf()
-                    uart1.write(POLL_TIM_SVIN)
-                    svin_result = None
-                    for _ in range(40):   # up to ~40 UBX frames before giving up
-                        res = readData(1)
-                        if isinstance(res, tuple) and len(res) == 9 and res[0] == 'svin':
-                            svin_result = res
-                            break
-                    if svin_result:
-                        _, dur, meanX, meanY, meanZ, meanAcc, obs, valid, active = svin_result
-                        # Pack as: inst=11, id, valid, active, dur, meanX, meanY, meanZ, meanAcc, obs
-                        pkt = data_packing(send_packet_format,
-                                           11, mac_id, valid, active, dur,
-                                           meanX, meanY, meanZ, meanAcc, obs)
-                        send_data(pkt)
-                        print("SVIN:", valid, active, dur, "s  acc:", meanAcc, "0.1mm")
-                    else:
-                        print("SVIN poll timed out")
-                        pkt = data_packing(send_packet_format, 100, mac_id, 17, 0, 0, 0, 0, 0, 0, 0)
-                        send_data(pkt)
-
-                elif inst == 12:  # Start survey-in (w_num=min_dur_s, ms=acc_01mm)
-                    cmd = build_svin_cmd(w_num, ms)
-                    uart1.write(cmd)
-                    print("Survey-in started: min_dur=", w_num, "s  acc_limit=", ms, "0.1mm")
-                    pkt = data_packing(send_packet_format, 12, mac_id, 0, 0, 0, 0, 0, 0, 0, 0)
-                    send_data(pkt)
-
-                elif inst == 13:  # Set FIXED coords (w_num=X_cm, ms=Y_cm, sub_ms=Z_cm, event_num=acc_01mm)
-                    cmd = build_fixed_cmd(w_num, ms, sub_ms, event_num)
-                    uart1.write(cmd)
-                    print("Fixed position set:", w_num, ms, sub_ms, "cm  acc:", event_num, "0.1mm")
-                    pkt = data_packing(send_packet_format, 13, mac_id, 0, 0, 0, 0, 0, 0, 0, 0)
-                    send_data(pkt)
-
-                elif inst == 14:  # Probe configured fixed-position (CFG-VALGET read-back)
-                    clearRxBuf()
-                    uart1.write(build_valget([
-                        CFG_TMODE_MODE, CFG_TMODE_POS_TYPE,
-                        CFG_TMODE_ECEF_X, CFG_TMODE_ECEF_Y, CFG_TMODE_ECEF_Z,
-                        CFG_TMODE_FIXED_POS_ACC]))
-                    tm3_result = None
-                    for _ in range(40):   # up to ~40 UBX frames before giving up
-                        res = readData(1)
-                        if isinstance(res, tuple) and len(res) == 7 and res[0] == 'tmode3':
-                            tm3_result = res
-                            break
-                    if tm3_result:
-                        _, mode, ecefX, ecefY, ecefZ, fixedPosAcc, pos_type = tm3_result
-                        # Pack as: inst=14, id, RF=mode, Cal=pos_type, ch=0,
-                        #          w_num=X_cm, ms=Y_cm, sub_ms=Z_cm, event_num=acc_01mm, count=0
-                        pkt = data_packing(send_packet_format,
-                                           14, mac_id, mode, pos_type, 0,
-                                           ecefX, ecefY, ecefZ, fixedPosAcc, 0)
-                        send_data(pkt)
-                        print("TMODE:", mode, ecefX, ecefY, ecefZ, "acc:", fixedPosAcc, "0.1mm")
-                    else:
-                        print("CFG-VALGET (TMODE) poll timed out")
-                        pkt = data_packing(send_packet_format, 100, mac_id, 18, 0, 0, 0, 0, 0, 0, 0)
-                        send_data(pkt)
+                # Slow-control (inst 11-17) is handled on the dedicated control
+                # channel via service_control()/handle_control — not here.
 
                 T1=time.ticks_us()
             

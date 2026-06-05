@@ -58,14 +58,20 @@ PACKET_FORMAT = "!iiiiiiiiii"
 PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
 BCAST_FORMAT = "!iiiii"  # server → ESP trigger/command format
             
+class CycleLimitReached(Exception):
+    """Raised by the writer when the configured max cycle count is hit, so the
+    main loop rolls over into a fresh run."""
+    pass
+
 class RotatingFileWriter:
-    def __init__(self, base_folder_name = "folder", base_file_name="file", ext=".txt", time_length = 10, gzip_files=False, header = ""):
+    def __init__(self, base_folder_name = "folder", base_file_name="file", ext=".txt", time_length = 10, gzip_files=False, header = "", max_cycles = 0):
         self.base_data_storage_folder = 'C:\\Users\\alexc\\OneDrive\\Desktop\\Claude_GUI_prac\\GPS Data'
         self.base_folder_name = base_folder_name
         self.base_file_name = base_file_name
         self.ext = ext
         self.time_length = time_length
         self.gzip_files = gzip_files
+        self.max_cycles = max_cycles   # 0 = unlimited
         self.date = datetime.now().strftime("%Y%m%d")
         self.folder_run_number = self._get_next_run_number()
         #self.run_number = self._get_next_run_number()
@@ -76,6 +82,10 @@ class RotatingFileWriter:
         self.connection_log = os.path.join(self.folder_dir, "connection_log.txt")
         self.error_log = os.path.join(self.folder_dir, "error_log.txt")
         self.unique_esp_log = os.path.join(self.folder_dir, "unique_esp_log.txt")
+        self.cpu_log = os.path.join(self.folder_dir, "gps_cpu_log.txt")
+        with open(self.cpu_log, 'a') as f:
+            f.write("timestamp; ID; cpuLoad; cpuLoadMax; memUsage; memUsageMax; "
+                    "ioUsage; ioUsageMax; runTime_s; temp_C; notice; warn; error\n")
         self.open_new_file()
 
     def _get_next_run_number(self):
@@ -104,6 +114,11 @@ class RotatingFileWriter:
         return folder_path
 
     def open_new_file(self):
+
+        # Cycle limit: cycle_number is the NEXT file to open. Once it exceeds the
+        # configured max, signal the main loop to start a fresh run instead.
+        if self.max_cycles and self.cycle_number > self.max_cycles:
+            raise CycleLimitReached()
 
         if hasattr(self, "file") and self.file:
             self._close_and_gzip()
@@ -240,6 +255,7 @@ def run_server():
 
     ctrl_clients = {}   # map control socket -> {'buffer': bytearray, 'addr': ..., 'id': int}
     ctrl_by_id = {}     # map esp mac_id -> its control socket
+    cpu_extra = {}      # map esp mac_id -> (notice, warn, error) from the latest inst=91
 
     udp_clients = set()
 
@@ -323,7 +339,10 @@ def run_server():
                         continue
 
                 info["buffer"].extend(data)
-                while len(info["buffer"]) >= PACKET_SIZE:
+                # Crash-proof: a bad packet or a momentarily-locked log file must
+                # never take down run_server (that would silently kill the control channel).
+                try:
+                  while len(info["buffer"]) >= PACKET_SIZE:
                     packet = info["buffer"][:PACKET_SIZE]
                     info["buffer"] = info["buffer"][PACKET_SIZE:]
                     inst, ID, RF, Cal, ch, w_num, ms, sub_ms, event_num, count = struct.unpack(PACKET_FORMAT, packet)
@@ -333,16 +352,16 @@ def run_server():
                         ctrl_by_id[ID] = s
                         info["id"] = ID
 
-                    if inst in (11, 12, 13, 14):
+                    if inst in (11, 12, 13, 14, 15, 16, 17, 18):
                         if ID == GUI_ID:
                             # Command from GUI -> forward to the target ESP's control socket
                             target_id   = RF
                             target_sock = ctrl_by_id.get(target_id)
                             if target_sock:
-                                if inst in (11, 14):  # status/probe: expect a reply back to this GUI
+                                if inst in (11, 14, 16, 18):  # status/probe/read/version: expect a reply
                                     pending_slow_ctrl[target_id] = s
                                     fwd = struct.pack(BCAST_FORMAT, inst, 0, 0, 0, 0)
-                                else:                 # 12/13 carry parameters
+                                else:                     # 12/13/15/17 carry parameters
                                     fwd = struct.pack(BCAST_FORMAT, inst, w_num, ms, sub_ms, event_num)
                                 try:
                                     target_sock.sendall(fwd)
@@ -358,7 +377,7 @@ def run_server():
                         else:
                             # Reply / confirmation from an ESP
                             writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                            if inst in (11, 14):
+                            if inst in (11, 14, 16, 18):
                                 gui_sock = pending_slow_ctrl.pop(ID, None)
                                 if gui_sock and gui_sock in sockets:
                                     response = struct.pack(PACKET_FORMAT, inst, ID, RF, Cal, ch, w_num, ms, sub_ms, event_num, count)
@@ -366,6 +385,25 @@ def run_server():
                                         gui_sock.sendall(response)
                                     except OSError:
                                         pass
+
+                    elif inst == 91:  # GPS health counts (sent right before inst=90)
+                        cpu_extra[ID] = (RF, Cal, ch)   # notice, warn, error
+                        print("Inst 91 found")
+                    elif inst == 90:  # autonomous GPS CPU/health telemetry from an ESP
+                        print("Inst 90 found")
+                        # RF=cpuLoad Cal=memUsage ch=ioUsage w_num=temp
+                        # ms=cpuLoadMax sub_ms=memUsageMax event_num=ioUsageMax count=runTime
+                        notice, warn, error = cpu_extra.get(ID, (0, 0, 0))
+                        try:
+                            with open(writer.cpu_log, 'a') as f:
+                                # cols: ts; ID; cpuLoad; cpuLoadMax; memUsage; memUsageMax; ioUsage; ioUsageMax; runTime; temp; notice; warn; error
+                                f.write(f"{datetime.now()}; {ID}; {RF}; {ms}; {Cal}; {sub_ms}; "
+                                        f"{ch}; {event_num}; {count}; {w_num}; {notice}; {warn}; {error}\n")
+                        except OSError as e:
+                            print(f"[SERVER] cpu_log write skipped: {e}")
+                except Exception as e:
+                    print(f"[SERVER] ctrl handler error (packet dropped): {e}")
+                    info["buffer"] = bytearray()
 
             else: #Reads client data
                 client_info = clients.get(s)
@@ -718,22 +756,37 @@ def run_server():
 
 if __name__ == "__main__":
 
+    import argparse
+    parser = argparse.ArgumentParser(description="GPS DAQ server")
+    parser.add_argument("--file-hours", type=float, default=1.0,
+                        help="hours of data per file/cycle (default 1)")
+    parser.add_argument("--max-cycles", type=int, default=0,
+                        help="cycles before auto-restarting into a new run (0 = unlimited)")
+    cli = parser.parse_args()
+    print(f"[SERVER] file-hours={cli.file_hours}  max-cycles={cli.max_cycles or 'unlimited'}")
+
     try:
         while True:
             try:
-                
+
                 HEADER = "Req Code; ID; RF; Cal; Ch; W#; t_ow mil; t_ow submil; Event; GPS Count"
-                writer = RotatingFileWriter(base_folder_name= "Run", base_file_name="gps_daq", ext=".txt", time_length = 1, header = HEADER) #1 hr long files
+                writer = RotatingFileWriter(base_folder_name= "Run", base_file_name="gps_daq", ext=".txt",
+                                            time_length = cli.file_hours, header = HEADER,
+                                            max_cycles = cli.max_cycles)
                 rise_BH_timestamp = 0
                 fall_BH_timestamp = 0
                 run_server()
+
+            except CycleLimitReached: # Cycle limit hit -> roll over into a fresh run
+                print(f"[SERVER] Cycle limit ({cli.max_cycles}) reached — starting a new run")
+                writer.close()
 
             except Exception as e: #Auto-restart server on any errors
                 print(f"[FATAL ERROR] {e}")
                 traceback.print_exc()
                 with open(writer.error_log, 'a') as f:
                     f.write(f"[SERVER] Fatal error: {e}\n{traceback.format_exc()}\n")
-                
+
                 writer.close()
 
                 print("Restarting server in 3 seconds...")

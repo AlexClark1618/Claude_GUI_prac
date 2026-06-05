@@ -1,14 +1,20 @@
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, messagebox
 import subprocess
 import threading
 import sys
 import os
+import re
 import socket
 import struct
+from datetime import datetime
+
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 SERVER_SCRIPT = r"C:\\Users\\alexc\\OneDrive\\Desktop\\Claude_GUI_prac\\GPS_DAQ_Server.py"
 SERVER_CWD = os.path.dirname(SERVER_SCRIPT)
+GPS_DATA_DIR = os.path.join(SERVER_CWD, "GPS Data")
 
 PACKET_FORMAT = "!iiiiiiiiii"
 PACKET_SIZE = struct.calcsize(PACKET_FORMAT)
@@ -34,12 +40,24 @@ DEVICE_IDS = {
     "Det 10": 0,
 }
 
+# CFG-RST navBbrMask presets (reset "temperature")
+RESET_TYPES = {"Hot": 0x0000, "Warm": 0x0001, "Cold": 0xFFFF}
+
+# CFG-RATE-TIMEREF enum.  "(no change)" -> -1 means leave the field untouched.
+TIMEREF_OPTIONS  = {"(no change)": -1, "UTC": 0, "GPS": 1, "GLONASS": 2, "BeiDou": 3, "Galileo": 4}
+TIMEREF_BY_VALUE = {0: "UTC", 1: "GPS", 2: "GLONASS", 3: "BeiDou", 4: "Galileo"}
+
+# gps_cpu_log.txt columns:
+# 0 ts 1 ID 2 cpuLoad 3 cpuLoadMax 4 memUsage 5 memUsageMax
+# 6 ioUsage 7 ioUsageMax 8 runTime 9 temp 10 notice 11 warn 12 error
+PLOT_METRICS = {"CPU load (%)": 2, "Mem usage (%)": 4, "IO usage (%)": 6, "Temp (°C)": 9}
+
 
 class GPSDAQApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("GPS DAQ Control")
-        self.root.geometry("780x560")
+        self.root.title("KoForce GUI")
+        self.root.geometry("820x720")
         self.root.resizable(True, True)
 
         self.server_process = None
@@ -71,12 +89,15 @@ class GPSDAQApp:
 
         server_tab = tk.Frame(self.notebook)
         gps_tab    = tk.Frame(self.notebook)
+        cpu_tab    = tk.Frame(self.notebook)
 
         self.notebook.add(server_tab, text="  Server Control  ")
-        self.notebook.add(gps_tab,    text="  GPS  ")
+        self.notebook.add(gps_tab,    text="  GPS Comms ")
+        self.notebook.add(cpu_tab,    text="  GPS Slow Control  ")
 
         self._build_server_tab(server_tab)
         self._build_gps_tab(gps_tab)
+        self._build_slowctrl_tab(cpu_tab)
 
     # ================================================================== #
     #  Tab 1 – Server Control
@@ -105,9 +126,20 @@ class GPSDAQApp:
             width=12, font=("Arial", 10),
         ).grid(row=0, column=2, padx=20)
 
+        # Run configuration (applied when the server is started)
+        cfg = tk.Frame(ctrl)
+        cfg.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        tk.Label(cfg, text="File time (hrs/cycle):").grid(row=0, column=0, sticky="w")
+        self.file_hours_entry = tk.Entry(cfg, width=7)
+        self.file_hours_entry.insert(0, "1")
+        self.file_hours_entry.grid(row=0, column=1, padx=(4, 16), sticky="w")
+        tk.Label(cfg, text="Max cycles (blank = no limit):").grid(row=0, column=2, sticky="w")
+        self.max_cycles_entry = tk.Entry(cfg, width=7)
+        self.max_cycles_entry.grid(row=0, column=3, padx=(4, 0), sticky="w")
+
         tk.Label(ctrl, text=f"Script: {SERVER_SCRIPT}",
                  font=("Arial", 8), fg="gray").grid(
-            row=1, column=0, columnspan=3, sticky="w", pady=(5, 0))
+            row=2, column=0, columnspan=4, sticky="w", pady=(5, 0))
 
         log_frame = tk.LabelFrame(parent, text="Server Output", padx=5, pady=5)
         log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
@@ -138,8 +170,8 @@ class GPSDAQApp:
         self.port_entry.insert(0, "12347")   # dedicated control channel (not the data port 12345)
         self.port_entry.grid(row=0, column=3, padx=4, sticky="w")
 
-        # ---- Device selector ----------------------------------------- #
-        dev = tk.LabelFrame(parent, text="Device", padx=10, pady=6)
+        # ---- GPS Controls (device select + restart + version) -------- #
+        dev = tk.LabelFrame(parent, text="GPS Controls", padx=10, pady=6)
         dev.pack(fill="x", padx=10, pady=4)
 
         tk.Label(dev, text="Select Device:").grid(row=0, column=0, sticky="w")
@@ -147,6 +179,22 @@ class GPSDAQApp:
         ttk.Combobox(dev, textvariable=self.device_var,
                      values=DEVICES, state="readonly", width=10
                      ).grid(row=0, column=1, padx=8, sticky="w")
+
+        # Restart receiver
+        tk.Label(dev, text="Restart:").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.reset_type_var = tk.StringVar(value="Warm")
+        ttk.Combobox(dev, textvariable=self.reset_type_var,
+                     values=["Hot", "Warm", "Cold"], state="readonly", width=7
+                     ).grid(row=1, column=1, padx=8, sticky="w", pady=(8, 0))
+        tk.Button(dev, text="Restart GPS", width=12,
+                  command=self.restart_gps).grid(row=1, column=2, sticky="w", pady=(8, 0))
+
+        # Comms test — version
+        tk.Button(dev, text="GPS Version", width=12,
+                  command=self.get_version).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.version_var = tk.StringVar(value="—")
+        tk.Label(dev, textvariable=self.version_var, font=("Arial", 8), fg="#555"
+                 ).grid(row=2, column=1, columnspan=3, sticky="w", pady=(8, 0))
 
         # ---- Survey -------------------------------------------------- #
         surv = tk.LabelFrame(parent, text="Survey-In  (TIM-SVIN)", padx=10, pady=8)
@@ -221,6 +269,27 @@ class GPSDAQApp:
                  font=("Arial", 8), fg="#555").grid(
             row=7, column=0, columnspan=4, sticky="w", pady=(2, 0))
 
+        # ---- Measurement rate (CFG-RATE) ----------------------------- #
+        rcv = tk.LabelFrame(parent, text="Measurement Rate  (CFG-RATE)", padx=10, pady=8)
+        rcv.pack(fill="x", padx=10, pady=4)
+
+        tk.Label(rcv, text="Meas (ms):").grid(row=0, column=0, sticky="w")
+        self.rate_meas_entry = tk.Entry(rcv, width=8)
+        self.rate_meas_entry.grid(row=0, column=1, padx=(2, 10), sticky="w")
+        tk.Label(rcv, text="Nav (cyc):").grid(row=0, column=2, sticky="w")
+        self.rate_nav_entry = tk.Entry(rcv, width=8)
+        self.rate_nav_entry.grid(row=0, column=3, padx=(2, 10), sticky="w")
+
+        tk.Label(rcv, text="TimeRef:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.timeref_var = tk.StringVar(value="(no change)")
+        ttk.Combobox(rcv, textvariable=self.timeref_var,
+                     values=list(TIMEREF_OPTIONS.keys()), state="readonly", width=11
+                     ).grid(row=1, column=1, padx=(2, 10), sticky="w", pady=(6, 0))
+        tk.Button(rcv, text="Read Rate", width=10,
+                  command=self.read_rate).grid(row=1, column=2, sticky="w", pady=(6, 0))
+        tk.Button(rcv, text="Set Rate", width=10,
+                  command=self.set_rate).grid(row=1, column=3, sticky="w", pady=(6, 0))
+
     def _make_coord_row(self, parent, row, bg=None):
         """Helper: place x / y / z / Acc label+entry pairs and return the entry dict."""
         fields = ["x", "y", "z", "Acc"]
@@ -242,9 +311,28 @@ class GPSDAQApp:
     def start_server(self):
         if self.server_process is not None:
             return
+
+        # Build run config from the entries (validated; sensible fallbacks)
+        try:
+            file_hours = float(self.file_hours_entry.get().strip() or "1")
+            if file_hours <= 0:
+                raise ValueError
+        except ValueError:
+            self._set_status("Bad 'File time' — enter a positive number of hours", "#e74c3c")
+            return
+        mc = self.max_cycles_entry.get().strip()
+        try:
+            max_cycles = int(mc) if mc else 0
+            if max_cycles < 0:
+                raise ValueError
+        except ValueError:
+            self._set_status("Bad 'Max cycles' — enter a whole number (or leave blank)", "#e74c3c")
+            return
+
         try:
             proc = subprocess.Popen(
-                [sys.executable, "-u", SERVER_SCRIPT],
+                [sys.executable, "-u", SERVER_SCRIPT,
+                 "--file-hours", str(file_hours), "--max-cycles", str(max_cycles)],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True, bufsize=1,
@@ -363,7 +451,7 @@ class GPSDAQApp:
             # inst=11, id=GUI_ID, RF=target ESP mac_id
             msg = (11, GUI_ID, target_id, 0, 0, 0, 0, 0, 0, 0)
             with socket.socket() as s:
-                s.settimeout(10)   # ESP needs time to poll UBX and reply
+                s.settimeout(20)   # ESP needs time to poll UBX and reply
                 s.connect((host, port))
                 s.sendall(struct.pack(PACKET_FORMAT, *msg))
                 data = self._recv_exact(s, PACKET_SIZE)
@@ -416,6 +504,8 @@ class GPSDAQApp:
         self._set_status("Sending fixed coordinates…", "#2980b9")
         threading.Thread(target=self._send_fix,
                          args=(x, y, z, acc), daemon=True).start()
+        self._clear_entries(self.fix_entries["x"], self.fix_entries["y"],
+                            self.fix_entries["z"], self.fix_entries["Acc"])
 
     def _send_fix(self, x, y, z, acc):
         try:
@@ -445,7 +535,7 @@ class GPSDAQApp:
             # inst=14, id=GUI_ID, RF=target ESP mac_id
             msg = (14, GUI_ID, target_id, 0, 0, 0, 0, 0, 0, 0)
             with socket.socket() as s:
-                s.settimeout(10)   # ESP needs time to poll UBX and reply
+                s.settimeout(20)   # ESP needs time to poll UBX and reply
                 s.connect((host, port))
                 s.sendall(struct.pack(PACKET_FORMAT, *msg))
                 data = self._recv_exact(s, PACKET_SIZE)
@@ -486,6 +576,253 @@ class GPSDAQApp:
             e.insert(0, val)
         self._set_status("Survey result copied to fix fields — review, then Send Fixed Coords", "#2980b9")
 
+    # ------------------------------------------------------------------ #
+    #  Receiver: restart + measurement rate
+    # ------------------------------------------------------------------ #
+
+    def restart_gps(self):
+        rtype = self.reset_type_var.get()
+        if not messagebox.askyesno(
+                "Restart GPS",
+                f"Send a {rtype} restart to the selected GPS?\n\n"
+                "This briefly interrupts data collection while the receiver "
+                "restarts. (Survey/fixed/rate config is saved to flash, so it "
+                "persists across the restart.)"):
+            return
+        self._set_status(f"Sending {rtype} restart…", "#2980b9")
+        threading.Thread(target=self._send_restart,
+                         args=(RESET_TYPES.get(rtype, 0x0001),), daemon=True).start()
+
+    def _send_restart(self, mask):
+        try:
+            host, port = self._get_host_port()
+            target_id  = self._target_esp_id()
+            # inst=15, RF=target, w_num=navBbrMask, ms=resetMode (0x01 = controlled SW reset)
+            msg = (15, GUI_ID, target_id, 0, 0, mask, 0x01, 0, 0, 0)
+            with socket.socket() as s:
+                s.settimeout(5)
+                s.connect((host, port))
+                s.sendall(struct.pack(PACKET_FORMAT, *msg))
+            self.root.after(0, lambda: self._set_status(
+                f"Restart sent to ESP {target_id}", "#27ae60"))
+        except Exception as e:
+            m = f"Restart error: {e}"
+            self.root.after(0, lambda: self._set_status(m, "#e74c3c"))
+
+    def read_rate(self):
+        self._set_status("Reading measurement rate…", "#2980b9")
+        threading.Thread(target=self._fetch_rate, daemon=True).start()
+
+    def _fetch_rate(self):
+        try:
+            host, port = self._get_host_port()
+            target_id  = self._target_esp_id()
+            msg = (16, GUI_ID, target_id, 0, 0, 0, 0, 0, 0, 0)
+            with socket.socket() as s:
+                s.settimeout(20)
+                s.connect((host, port))
+                s.sendall(struct.pack(PACKET_FORMAT, *msg))
+                data = self._recv_exact(s, PACKET_SIZE)
+
+            if len(data) < PACKET_SIZE:
+                raise ValueError(f"Short packet ({len(data)} bytes)")
+
+            # Response: inst=16, id, RF=timeref, Cal, ch, w_num=meas_ms, ms=nav, ...
+            _, _, timeref, _, _, meas, nav, _, _, _ = struct.unpack(PACKET_FORMAT, data)
+
+            def update():
+                self.rate_meas_entry.delete(0, tk.END); self.rate_meas_entry.insert(0, str(meas))
+                self.rate_nav_entry.delete(0, tk.END);  self.rate_nav_entry.insert(0, str(nav))
+                self.timeref_var.set(TIMEREF_BY_VALUE.get(timeref, "(no change)"))
+                hz = (1000.0 / meas) if meas else 0
+                self._set_status(
+                    f"Rate: {meas} ms ({hz:.2f} Hz), nav {nav} cyc, "
+                    f"timeref {TIMEREF_BY_VALUE.get(timeref, timeref)}", "#27ae60")
+
+            self.root.after(0, update)
+
+        except Exception as e:
+            m = f"Read rate error: {e}"
+            self.root.after(0, lambda: self._set_status(m, "#e74c3c"))
+
+    def set_rate(self):
+        try:
+            meas = int(self.rate_meas_entry.get()) if self.rate_meas_entry.get().strip() else 0
+            nav  = int(self.rate_nav_entry.get())  if self.rate_nav_entry.get().strip()  else 0
+        except ValueError:
+            self._set_status("Bad rate values — enter integers (blank = leave unchanged)", "#e74c3c")
+            return
+        timeref = TIMEREF_OPTIONS.get(self.timeref_var.get(), -1)
+        if meas <= 0 and nav <= 0 and timeref < 0:
+            self._set_status("Nothing to set — fill Meas/Nav or pick a TimeRef", "#e67e22")
+            return
+        self._set_status("Setting measurement rate…", "#2980b9")
+        threading.Thread(target=self._send_rate, args=(meas, nav, timeref), daemon=True).start()
+        self._clear_entries(self.rate_meas_entry, self.rate_nav_entry)
+        self.timeref_var.set("(no change)")
+
+    def _send_rate(self, meas, nav, timeref):
+        try:
+            host, port = self._get_host_port()
+            target_id  = self._target_esp_id()
+            # inst=17, RF=target, w_num=meas_ms, ms=nav, sub_ms=timeref (<=0 / <0 = skip on ESP)
+            msg = (17, GUI_ID, target_id, 0, 0, meas, nav, timeref, 0, 0)
+            with socket.socket() as s:
+                s.settimeout(5)
+                s.connect((host, port))
+                s.sendall(struct.pack(PACKET_FORMAT, *msg))
+            self.root.after(0, lambda: self._set_status(
+                f"Rate set on ESP {target_id}  (meas {meas} ms, nav {nav}, timeref {timeref})",
+                "#27ae60"))
+        except Exception as e:
+            m = f"Set rate error: {e}"
+            self.root.after(0, lambda: self._set_status(m, "#e74c3c"))
+
+    def get_version(self):
+        self._set_status("Reading GPS version…", "#2980b9")
+        threading.Thread(target=self._fetch_version, daemon=True).start()
+
+    def _fetch_version(self):
+        try:
+            host, port = self._get_host_port()
+            target_id  = self._target_esp_id()
+            msg = (18, GUI_ID, target_id, 0, 0, 0, 0, 0, 0, 0)
+            with socket.socket() as s:
+                s.settimeout(20)
+                s.connect((host, port))
+                s.sendall(struct.pack(PACKET_FORMAT, *msg))
+                data = self._recv_exact(s, PACKET_SIZE)
+            if len(data) < PACKET_SIZE:
+                raise ValueError(f"Short packet ({len(data)} bytes)")
+            ints = struct.unpack(PACKET_FORMAT, data)
+            # 8 data ints carry 32 bytes of the version string
+            vbytes = struct.pack("!8i", *ints[2:10])
+            ver = vbytes.split(b"\x00")[0].decode("ascii", "replace").strip()
+
+            def update():
+                self.version_var.set(ver or "(empty)")
+                self._set_status(f"GPS version: {ver}", "#27ae60")
+            self.root.after(0, update)
+        except Exception as e:
+            m = f"Version error: {e}"
+            self.root.after(0, lambda: self._set_status(m, "#e74c3c"))
+
+    # ================================================================== #
+    #  Tab 3 – GPS Slow Control (live health plot + per-unit stats)
+    # ================================================================== #
+
+    def _build_slowctrl_tab(self, parent):
+        ctl = tk.Frame(parent)
+        ctl.pack(fill="x", padx=8, pady=(6, 2))
+
+        tk.Label(ctl, text="Plot metric:").pack(side="left")
+        self.cpu_metric_var = tk.StringVar(value="CPU load (%)")
+        ttk.Combobox(ctl, textvariable=self.cpu_metric_var,
+                     values=list(PLOT_METRICS.keys()), state="readonly", width=14
+                     ).pack(side="left", padx=(4, 16))
+
+        tk.Label(ctl, text="Stats for GPS:").pack(side="left")
+        self.cpu_unit_var = tk.StringVar(value="—")
+        self.cpu_unit_combo = ttk.Combobox(ctl, textvariable=self.cpu_unit_var,
+                                            values=[], state="readonly", width=8)
+        self.cpu_unit_combo.pack(side="left", padx=4)
+
+        self.cpu_fig = Figure(figsize=(6, 3.0), dpi=100)
+        self.cpu_ax = self.cpu_fig.add_subplot(111)
+        self.cpu_canvas = FigureCanvasTkAgg(self.cpu_fig, master=parent)
+        self.cpu_canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+        # Per-unit stats readout (latest values for the selected GPS)
+        stats = tk.LabelFrame(parent, text="Latest stats (selected GPS)", padx=8, pady=4)
+        stats.pack(fill="x", padx=8, pady=(0, 8))
+        self.cpu_stat_vars = {}
+        labels = ["Max CPU %", "Max Mem %", "Max IO %", "Runtime (s)",
+                  "Notices", "Warnings", "Errors"]
+        for i, name in enumerate(labels):
+            tk.Label(stats, text=name, font=("Arial", 8), fg="#444").grid(row=0, column=i, padx=6)
+            v = tk.StringVar(value="—")
+            tk.Label(stats, textvariable=v, font=("Arial", 10, "bold")).grid(row=1, column=i, padx=6)
+            self.cpu_stat_vars[name] = v
+
+        self._update_slowctrl()
+
+    def _latest_cpu_log(self):
+        """Path to the gps_cpu_log.txt in the highest-numbered run folder, or None."""
+        best, best_n = None, -1
+        try:
+            for name in os.listdir(GPS_DATA_DIR):
+                m = re.match(r"Run_(\d+)_", name)
+                p = os.path.join(GPS_DATA_DIR, name)
+                if m and os.path.isdir(p):
+                    n = int(m.group(1))
+                    if n > best_n:
+                        best_n, best = n, os.path.join(p, "gps_cpu_log.txt")
+        except OSError:
+            pass
+        return best
+
+    def _update_slowctrl(self):
+        try:
+            metric_col = PLOT_METRICS.get(self.cpu_metric_var.get(), 2)
+            path = self._latest_cpu_log()
+            times = {}    # id -> [datetime]
+            yvals = {}    # id -> [metric value]
+            last = {}     # id -> full parts list (latest row)
+            if path and os.path.exists(path):
+                with open(path) as f:
+                    for line in f:
+                        parts = [p.strip() for p in line.split(";")]
+                        if len(parts) < 13:
+                            continue
+                        try:
+                            uid = int(parts[1])
+                            y = int(parts[metric_col])
+                            t = datetime.strptime(parts[0], "%Y-%m-%d %H:%M:%S.%f")
+                        except (ValueError, IndexError):
+                            continue   # skips the header row too
+                        times.setdefault(uid, []).append(t)
+                        yvals.setdefault(uid, []).append(y)
+                        last[uid] = parts
+
+            # Keep the unit dropdown in sync with the IDs we've seen
+            ids = [str(u) for u in sorted(last)]
+            if list(self.cpu_unit_combo["values"]) != ids:
+                self.cpu_unit_combo["values"] = ids
+                if self.cpu_unit_var.get() not in ids and ids:
+                    self.cpu_unit_var.set(ids[0])
+
+            # Plot the selected metric for every unit
+            self.cpu_ax.clear()
+            self.cpu_ax.set_title(self.cpu_metric_var.get())
+            self.cpu_ax.set_ylabel(self.cpu_metric_var.get())
+            if metric_col != 9:           # 0-100 for %, autoscale for temp
+                self.cpu_ax.set_ylim(0, 100)
+            for uid in sorted(yvals):
+                self.cpu_ax.plot(times[uid], yvals[uid], marker="o", ms=3, label=f"ID {uid}")
+            if yvals:
+                self.cpu_ax.legend(loc="upper left", fontsize=8)
+                self.cpu_fig.autofmt_xdate()
+            else:
+                self.cpu_ax.text(0.5, 0.5, "waiting for telemetry…", ha="center", va="center",
+                                 transform=self.cpu_ax.transAxes, color="#888")
+            self.cpu_canvas.draw_idle()
+
+            # Stats readout for the selected unit
+            sel = self.cpu_unit_var.get()
+            try:
+                p = last.get(int(sel)) if sel not in ("", "—") else None
+            except ValueError:
+                p = None
+            keys = ["Max CPU %", "Max Mem %", "Max IO %", "Runtime (s)",
+                    "Notices", "Warnings", "Errors"]
+            cols = [3, 5, 7, 8, 10, 11, 12]
+            for name, col in zip(keys, cols):
+                self.cpu_stat_vars[name].set(p[col] if p else "—")
+        except Exception:
+            pass
+        finally:
+            self.root.after(3000, self._update_slowctrl)
+
     # ================================================================== #
     #  Shared helpers
     # ================================================================== #
@@ -493,6 +830,13 @@ class GPSDAQApp:
     def _set_status(self, text, color="#555555"):
         self.status_var.set(text)
         self.status_bar.config(bg=color)
+
+    @staticmethod
+    def _clear_entries(*entries):
+        """Blank out the given tk.Entry widgets (called after a send so a second
+        button press doesn't re-fire stale values)."""
+        for e in entries:
+            e.delete(0, tk.END)
 
     def _append_log(self, text):
         def _update():

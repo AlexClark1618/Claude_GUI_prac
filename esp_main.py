@@ -55,6 +55,7 @@ UBX_HDR = b'\xb5\x62'
 RXM_TM =(2,116)   #b'\x02\x74'
 TIM_TM2= (13,3)   #b'\x0d\x03'
 NAV_CLOCK= (1,34)       #b'\x01\x22'
+NAV_POSLLH= (1,2)       #b'\x01\x02' geodetic position (lat/lon/height + acc)
 TIM_SVIN  = (13,4)      #b'\x0d\x04'
 CFG_TMODE3 = (6,0x71)   #b'\x06\x71' legacy Time Mode 3 (NOT honored on F9 — kept for reference only)
 CFG_VALGET = (6,0x8b)   #b'\x06\x8b' UBX-CFG-VALGET response (F9 config read-back)
@@ -65,11 +66,20 @@ POLL_TIM_SVIN  = b'\xb5\x62\x0d\x04\x00\x00\x11\x40'  # poll survey-in status (T
 
 # UBX builders + CFG key constants now live in gps_ubx.py — upload it to the ESP too.
 from gps_ubx import (build_valget, build_svin_cmd, build_fixed_cmd,
-                     build_rst, build_rate_set, POLL_MON_VER, POLL_MON_SYS,
+                     build_rst, build_rate_set, build_tp1_cmd,
+                     POLL_MON_VER, POLL_MON_SYS, POLL_NAV_POSLLH,
                      CFG_TMODE_MODE, CFG_TMODE_POS_TYPE,
                      CFG_TMODE_ECEF_X, CFG_TMODE_ECEF_Y, CFG_TMODE_ECEF_Z,
                      CFG_TMODE_FIXED_POS_ACC,
-                     CFG_RATE_MEAS, CFG_RATE_NAV, CFG_RATE_TIMEREF, RATE_KEYS)
+                     CFG_RATE_MEAS, CFG_RATE_NAV, CFG_RATE_TIMEREF, RATE_KEYS,
+                     TP1_KEYS, CFG_TP_TP1_ENA, CFG_TP_PULSE_DEF, CFG_TP_PULSE_LENGTH_DEF,
+                     CFG_TP_POL_TP1, CFG_TP_ALIGN_TO_TOW_TP1, CFG_TP_SYNC_GNSS_TP1,
+                     CFG_TP_USE_LOCKED_TP1, CFG_TP_FREQ_TP1, CFG_TP_FREQ_LOCK_TP1,
+                     CFG_TP_PERIOD_TP1, CFG_TP_PERIOD_LOCK_TP1,
+                     CFG_TP_LEN_TP1, CFG_TP_LEN_LOCK_TP1,
+                     CFG_TP_DUTY_TP1, CFG_TP_DUTY_LOCK_TP1, CFG_TP_ANT_CABLEDELAY,
+                     TP1_F_ENABLE, TP1_F_ISFREQ, TP1_F_POL, TP1_F_ALIGNTOW,
+                     TP1_F_LOCKGPS, TP1_F_USELOCK, TP1_F_ISLENGTH, TP1_DUTY_SCALE)
 
 MON_VER = (10, 0x04)   # b'\x0a\x04' UBX-MON-VER  (version strings)
 MON_SYS = (10, 0x39)   # b'\x0a\x39' UBX-MON-SYS  (CPU/mem/IO load)
@@ -730,6 +740,24 @@ def readData(det):
             active  = plb[27]
             return ('svin', dur, meanX, meanY, meanZ, meanAcc, obs, valid, active)
 
+        # ---------- NAV-POSLLH (geodetic position + accuracy) ----------
+        elif (cls, msg) == NAV_POSLLH:
+            # Payload layout (28 bytes):
+            #   0  iTOW   U4  ms
+            #   4  lon    I4  1e-7 deg
+            #   8  lat    I4  1e-7 deg
+            #  12  height I4  mm  (above ellipsoid)
+            #  16  hMSL   I4  mm  (above mean sea level)
+            #  20  hAcc   U4  mm  (horizontal accuracy estimate)
+            #  24  vAcc   U4  mm  (vertical accuracy estimate)
+            lon    = ustruct.unpack_from('<i', plb, 4)[0]
+            lat    = ustruct.unpack_from('<i', plb, 8)[0]
+            height = ustruct.unpack_from('<i', plb, 12)[0]
+            hMSL   = ustruct.unpack_from('<i', plb, 16)[0]
+            hAcc   = plb[20] | (plb[21] << 8) | (plb[22] << 16) | (plb[23] << 24)
+            vAcc   = plb[24] | (plb[25] << 8) | (plb[26] << 16) | (plb[27] << 24)
+            return ('posllh', lon, lat, height, hMSL, hAcc, vAcc)
+
         # ---------- CFG-VALGET (config read-back, F9 interface) ----------
         elif (cls, msg) == CFG_VALGET:
             # Payload: version(U1) layer(U1) position(U2), then key/value pairs.
@@ -868,11 +896,21 @@ def send_ctrl(d):
         ctrl_s = reconnect_ctrl_socket()
         return None
 
+def _duty_q_to_scaled(raw_q):
+    """The generic CFG-VALGET parser reads an R8 duty key as a signed 64-bit
+    int (the raw bytes). Reinterpret those bytes as a double and return it
+    scaled to the integer transport: round(percent * TP1_DUTY_SCALE)."""
+    try:
+        duty = ustruct.unpack('<d', ustruct.pack('<q', raw_q))[0]
+    except Exception:
+        return 0
+    return int(round(duty * TP1_DUTY_SCALE))
+
 def handle_control(inst, w_num, ms, sub_ms, event_num):
     """Service one slow-control command. inst 12/13 are fast (write a UBX
     config and confirm); inst 11/14 poll the GPS (clearRxBuf + read frames)
     and so briefly interrupt data collection — acceptable for manual probes."""
-    if inst == 11:    # Survey-in status query
+    if inst == 201:   # Survey-in status query
         clearRxBuf()
         uart1.write(POLL_TIM_SVIN)
         svin_result = None
@@ -883,23 +921,23 @@ def handle_control(inst, w_num, ms, sub_ms, event_num):
                 break
         if svin_result:
             _, dur, meanX, meanY, meanZ, meanAcc, obs, valid, active = svin_result
-            send_ctrl(data_packing(send_packet_format, 11, mac_id, valid, active, dur, meanX, meanY, meanZ, meanAcc, obs))
+            send_ctrl(data_packing(send_packet_format, 201, mac_id, valid, active, dur, meanX, meanY, meanZ, meanAcc, obs))
             print("SVIN:", valid, active, dur, "s  acc:", meanAcc, "0.1mm")
         else:
             print("SVIN poll timed out")
             send_ctrl(data_packing(send_packet_format, 100, mac_id, 17, 0, 0, 0, 0, 0, 0, 0))
 
-    elif inst == 12:  # Start survey-in (w_num=min_dur_s, ms=acc_01mm)
+    elif inst == 202:  # Start survey-in (w_num=min_dur_s, ms=acc_01mm)
         uart1.write(build_svin_cmd(w_num, ms))
         print("Survey-in started: min_dur=", w_num, "s  acc_limit=", ms, "0.1mm")
-        send_ctrl(data_packing(send_packet_format, 12, mac_id, 0, 0, 0, 0, 0, 0, 0, 0))
+        send_ctrl(data_packing(send_packet_format, 202, mac_id, 0, 0, 0, 0, 0, 0, 0, 0))
 
-    elif inst == 13:  # Set FIXED coords (w_num=X_cm, ms=Y_cm, sub_ms=Z_cm, event_num=acc_01mm)
+    elif inst == 203:  # Set FIXED coords (w_num=X_cm, ms=Y_cm, sub_ms=Z_cm, event_num=acc_01mm)
         uart1.write(build_fixed_cmd(w_num, ms, sub_ms, event_num))
         print("Fixed position set:", w_num, ms, sub_ms, "cm  acc:", event_num, "0.1mm")
-        send_ctrl(data_packing(send_packet_format, 13, mac_id, 0, 0, 0, 0, 0, 0, 0, 0))
+        send_ctrl(data_packing(send_packet_format, 203, mac_id, 0, 0, 0, 0, 0, 0, 0, 0))
 
-    elif inst == 14:  # Probe configured fixed-position (CFG-VALGET read-back)
+    elif inst == 204:  # Probe configured fixed-position (CFG-VALGET read-back)
         cfg = poll_valget([
             CFG_TMODE_MODE, CFG_TMODE_POS_TYPE,
             CFG_TMODE_ECEF_X, CFG_TMODE_ECEF_Y, CFG_TMODE_ECEF_Z,
@@ -911,38 +949,38 @@ def handle_control(inst, w_num, ms, sub_ms, event_num):
             ecefY       = cfg.get(CFG_TMODE_ECEF_Y, 0)
             ecefZ       = cfg.get(CFG_TMODE_ECEF_Z, 0)
             fixedPosAcc = cfg.get(CFG_TMODE_FIXED_POS_ACC, 0)
-            send_ctrl(data_packing(send_packet_format, 14, mac_id, mode, pos_type, 0, ecefX, ecefY, ecefZ, fixedPosAcc, 0))
+            send_ctrl(data_packing(send_packet_format, 204, mac_id, mode, pos_type, 0, ecefX, ecefY, ecefZ, fixedPosAcc, 0))
             print("TMODE:", mode, ecefX, ecefY, ecefZ, "acc:", fixedPosAcc, "0.1mm")
         else:
             print("CFG-VALGET (TMODE) poll timed out")
             send_ctrl(data_packing(send_packet_format, 100, mac_id, 18, 0, 0, 0, 0, 0, 0, 0))
 
-    elif inst == 15:  # Restart GPS (w_num=navBbrMask, ms=resetMode). No ACK from receiver.
+    elif inst == 205:  # Restart GPS (w_num=navBbrMask, ms=resetMode). No ACK from receiver.
         uart1.write(build_rst(w_num, ms))
         print("GPS restart sent: navBbrMask=", w_num, " resetMode=", ms)
-        send_ctrl(data_packing(send_packet_format, 15, mac_id, 0, 0, 0, 0, 0, 0, 0, 0))
+        send_ctrl(data_packing(send_packet_format, 205, mac_id, 0, 0, 0, 0, 0, 0, 0, 0))
 
-    elif inst == 16:  # Read CFG-RATE (report) via CFG-VALGET
+    elif inst == 206:  # Read CFG-RATE (report) via CFG-VALGET
         cfg = poll_valget(RATE_KEYS, CFG_RATE_MEAS)
         if cfg is not None:
             meas_ms = cfg.get(CFG_RATE_MEAS, 0)
             nav     = cfg.get(CFG_RATE_NAV, 0)
             timeref = cfg.get(CFG_RATE_TIMEREF, 0)
-            # inst=16, id, RF=timeref, Cal=0, ch=0, w_num=meas_ms, ms=nav, ...
-            send_ctrl(data_packing(send_packet_format, 16, mac_id, timeref, 0, 0, meas_ms, nav, 0, 0, 0))
+            # inst=206, id, RF=timeref, Cal=0, ch=0, w_num=meas_ms, ms=nav, ...
+            send_ctrl(data_packing(send_packet_format, 206, mac_id, timeref, 0, 0, meas_ms, nav, 0, 0, 0))
             print("RATE: meas=", meas_ms, "ms  nav=", nav, "  timeref=", timeref)
         else:
             print("CFG-VALGET (RATE) poll timed out")
             send_ctrl(data_packing(send_packet_format, 100, mac_id, 19, 0, 0, 0, 0, 0, 0, 0))
 
-    elif inst == 17:  # Set CFG-RATE (w_num=meas_ms, ms=nav_cycles, sub_ms=timeref; <=0 / <0 = skip)
+    elif inst == 207:  # Set CFG-RATE (w_num=meas_ms, ms=nav_cycles, sub_ms=timeref; <=0 / <0 = skip)
         cmd = build_rate_set(w_num, ms, sub_ms)
         if cmd is not None:
             uart1.write(cmd)
             print("RATE set: meas=", w_num, "ms  nav=", ms, "  timeref=", sub_ms)
-        send_ctrl(data_packing(send_packet_format, 17, mac_id, 0, 0, 0, 0, 0, 0, 0, 0))
+        send_ctrl(data_packing(send_packet_format, 207, mac_id, 0, 0, 0, 0, 0, 0, 0, 0))
 
-    elif inst == 18:  # GPS comms test — return MON-VER swVersion (up to 32 chars packed into 8 ints)
+    elif inst == 208:  # GPS comms test — return MON-VER swVersion (up to 32 chars packed into 8 ints)
         clearRxBuf()
         uart1.write(POLL_MON_VER)
         sw = None
@@ -955,12 +993,71 @@ def handle_control(inst, w_num, ms, sub_ms, event_num):
             sw = bytes(sw)[:32]
             sw = sw + b'\x00' * (32 - len(sw))
             vi = ustruct.unpack('!8i', sw)   # 32 bytes -> 8 ints (round-trips on the GUI)
-            send_ctrl(data_packing(send_packet_format, 18, mac_id,
+            send_ctrl(data_packing(send_packet_format, 208, mac_id,
                                    vi[0], vi[1], vi[2], vi[3], vi[4], vi[5], vi[6], vi[7]))
             print("MON-VER:", sw)
         else:
             print("MON-VER poll timed out")
             send_ctrl(data_packing(send_packet_format, 100, mac_id, 20, 0, 0, 0, 0, 0, 0, 0))
+
+    elif inst == 209:  # Read TP1 (PPS) config via CFG-VALGET
+        cfg = poll_valget(TP1_KEYS, CFG_TP_TP1_ENA)
+        if cfg is not None:
+            flags = 0
+            if cfg.get(CFG_TP_TP1_ENA):          flags |= TP1_F_ENABLE
+            if cfg.get(CFG_TP_PULSE_DEF):        flags |= TP1_F_ISFREQ
+            if cfg.get(CFG_TP_POL_TP1):          flags |= TP1_F_POL
+            if cfg.get(CFG_TP_ALIGN_TO_TOW_TP1): flags |= TP1_F_ALIGNTOW
+            if cfg.get(CFG_TP_SYNC_GNSS_TP1):    flags |= TP1_F_LOCKGPS
+            if cfg.get(CFG_TP_USE_LOCKED_TP1):   flags |= TP1_F_USELOCK
+            if flags & TP1_F_ISFREQ:
+                val_un   = cfg.get(CFG_TP_FREQ_TP1, 0)
+                val_lock = cfg.get(CFG_TP_FREQ_LOCK_TP1, 0)
+            else:
+                val_un   = cfg.get(CFG_TP_PERIOD_TP1, 0)
+                val_lock = cfg.get(CFG_TP_PERIOD_LOCK_TP1, 0)
+            if cfg.get(CFG_TP_PULSE_LENGTH_DEF):       # 1 = length (µs)
+                flags |= TP1_F_ISLENGTH
+                pw_un   = cfg.get(CFG_TP_LEN_TP1, 0)
+                pw_lock = cfg.get(CFG_TP_LEN_LOCK_TP1, 0)
+            else:                                       # 0 = duty cycle (R8 %)
+                pw_un   = _duty_q_to_scaled(cfg.get(CFG_TP_DUTY_TP1, 0))
+                pw_lock = _duty_q_to_scaled(cfg.get(CFG_TP_DUTY_LOCK_TP1, 0))
+            cable    = cfg.get(CFG_TP_ANT_CABLEDELAY, 0)
+            # inst=209, RF=flags, w_num=val_un, ms=val_lock, sub_ms=pw_un, event_num=pw_lock, count=cable
+            send_ctrl(data_packing(send_packet_format, 209, mac_id, flags, 0, 0,
+                                   val_un, val_lock, pw_un, pw_lock, cable))
+            print("TP1:", "freq" if flags & TP1_F_ISFREQ else "period",
+                  val_un, "/", val_lock,
+                  (" len" if flags & TP1_F_ISLENGTH else " duty*scale"),
+                  pw_un, "/", pw_lock, " flags", flags)
+        else:
+            print("CFG-VALGET (TP1) poll timed out")
+            send_ctrl(data_packing(send_packet_format, 100, mac_id, 21, 0, 0, 0, 0, 0, 0, 0))
+
+    elif inst == 210:  # Set TP1 (PPS): w_num=value, ms=pulse_width, sub_ms=flags, event_num=cable_ns
+        uart1.write(build_tp1_cmd(w_num, ms, sub_ms, event_num))
+        print("TP1 set: value=", w_num, " pulse=", ms, " flags=", sub_ms, " cable=", event_num, "ns")
+        send_ctrl(data_packing(send_packet_format, 210, mac_id, 0, 0, 0, 0, 0, 0, 0, 0))
+
+    elif inst == 211:  # Read NAV-POSLLH (lat/lon/height + horizontal/vertical accuracy)
+        clearRxBuf()
+        uart1.write(POLL_NAV_POSLLH)
+        pos = None
+        for _ in range(40):
+            res = readData(1)
+            if isinstance(res, tuple) and len(res) == 7 and res[0] == 'posllh':
+                pos = res
+                break
+        if pos:
+            _, lon, lat, height, hMSL, hAcc, vAcc = pos
+            # inst=211, RF=vAcc, w_num=lon, ms=lat, sub_ms=height, event_num=hMSL, count=hAcc
+            send_ctrl(data_packing(send_packet_format, 211, mac_id, vAcc, 0, 0,
+                                   lon, lat, height, hMSL, hAcc))
+            print("POSLLH: lat", lat, " lon", lon, " h", height, "mm  hAcc", hAcc, " vAcc", vAcc)
+        else:
+            print("NAV-POSLLH poll timed out")
+            send_ctrl(data_packing(send_packet_format, 100, mac_id, 22, 0, 0, 0, 0, 0, 0, 0))
 
 def poll_mon_sys():
     """Poll MON-SYS and return ('monsys', cpuLoad, cpuLoadMax, memUsage,

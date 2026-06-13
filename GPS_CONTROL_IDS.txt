@@ -1,0 +1,123 @@
+================================================================================
+ GPS DAQ — Control Instruction ID Reference
+================================================================================
+GUI -> GPS control commands use instruction codes in the 200-299 range.
+(Renumbered from the old 11-20 scheme. Telemetry / data codes are unchanged.)
+
+Transport:
+  All packets are 10 signed 32-bit ints, big-endian (struct "!iiiiiiiiii"):
+      inst, ID, RF, Cal, ch, w_num, ms, sub_ms, event_num, count
+  - inst : instruction code (this document)
+  - ID   : sender id. The GUI uses GUI_ID = 1. An ESP uses its mac_id.
+  - RF   : in a GUI request = TARGET ESP mac_id. In a reply = first data field.
+  GUI -> server (control port 12347) -> ESP. The server forwards a 5-int
+  trigger (inst, w_num, ms, sub_ms, event_num) to the target ESP; replies come
+  back on the same path as a full 10-int packet.
+
+Pipeline files:
+  - ServerControlGUI.py  : builds/sends the requests, parses replies (GUI)
+  - GPS_DAQ_Server.py    : routes GUI<->ESP by inst + target mac_id
+  - esp_main.py          : handle_control() services each inst on the ESP
+  - gps_ubx.py           : UBX (CFG-VALSET/VALGET) message builders + keys
+
+================================================================================
+ GUI -> GPS CONTROL CODES (200-299)
+================================================================================
+
+201  SURVEY-IN STATUS QUERY            (was 11)   [expects reply]
+     Poll TIM-SVIN survey-in progress on the target receiver.
+     Request : RF=target. (no parameters)
+     Reply   : RF=valid(0/1)  Cal=active(0/1)  ch=duration_s
+               w_num=meanX_cm  ms=meanY_cm  sub_ms=meanZ_cm
+               event_num=meanAcc_0.1mm  count=observations
+
+202  START SURVEY-IN                   (was 12)   [confirmation only]
+     Put the receiver into survey-in mode (CFG-TMODE = survey-in).
+     Request : w_num=min_duration_s   ms=accuracy_limit_0.1mm
+
+203  SET FIXED COORDINATES             (was 13)   [confirmation only]
+     Put the receiver into fixed-position mode (CFG-TMODE = fixed, ECEF).
+     Request : w_num=X_cm  ms=Y_cm  sub_ms=Z_cm  event_num=accuracy_0.1mm
+
+204  PROBE FIXED POSITION              (was 14)   [expects reply]
+     Read back the configured time-mode / fixed position (CFG-VALGET).
+     Reply   : RF=mode(0=disabled,1=survey-in,2=fixed)  Cal=pos_type(0=ECEF)
+               w_num=X_cm  ms=Y_cm  sub_ms=Z_cm  event_num=accuracy_0.1mm
+
+205  RESTART GPS                       (was 15)   [confirmation only]
+     CFG-RST the receiver. (No ACK from the receiver itself.)
+     Request : w_num=navBbrMask (0x0000=Hot, 0x0001=Warm, 0xFFFF=Cold)
+               ms=resetMode (0x01 = controlled software reset)
+
+206  READ MEASUREMENT RATE             (was 16)   [expects reply]
+     Read CFG-RATE (CFG-VALGET).
+     Reply   : RF=timeRef(0=UTC,1=GPS,2=GLONASS,3=BeiDou,4=Galileo)
+               w_num=meas_period_ms  ms=nav_rate_cycles
+
+207  SET MEASUREMENT RATE              (was 17)   [confirmation only]
+     Set CFG-RATE. Any field <=0 (or timeRef <0) is left unchanged.
+     Request : w_num=meas_period_ms  ms=nav_rate_cycles  sub_ms=timeRef
+
+208  GPS VERSION (MON-VER)             (was 18)   [expects reply]
+     Comms test — returns the receiver software version string.
+     Reply   : the 8 data ints (RF..count) hold up to 32 ASCII bytes of
+               swVersion, null-padded.
+
+209  READ TP1 / PPS CONFIG             (was 19)   [expects reply]
+     Read the TP1 time-pulse settings (CFG-VALGET, CFG-TP- keys).
+     Reply   : RF=flags (see TP1 FLAG BITS below)
+               w_num=value_unlocked   ms=value_locked
+                     (frequency in Hz if flag ISFREQ set, else period in us)
+               sub_ms=pulse_unlocked  event_num=pulse_locked
+                     (length in us if flag ISLENGTH set, else duty% * 1000)
+               count=antenna_cable_delay_ns
+
+210  SET TP1 / PPS CONFIG              (was 20)   [confirmation only]
+     Write the TP1 time-pulse settings (CFG-VALSET). Locked and unlocked
+     values are set the same. Duty cycle is carried as percent * 1000.
+     Request : w_num=value        (Hz if flag ISFREQ set, else period us)
+               ms=pulse_width     (length us if flag ISLENGTH set, else duty%*1000)
+               sub_ms=flags       (see TP1 FLAG BITS below)
+               event_num=antenna_cable_delay_ns
+
+211  READ NAV-POSLLH (position)        (new)      [expects reply]
+     Poll the geodetic position + accuracy estimate (UBX NAV-POSLLH).
+     Used by Auto Survey to record lat/lon/height when a survey finishes.
+     Reply   : RF=vAcc_mm (vertical accuracy)
+               w_num=lon_1e-7deg   ms=lat_1e-7deg
+               sub_ms=height_mm (ellipsoidal)   event_num=hMSL_mm (mean sea level)
+               count=hAcc_mm (2D horizontal accuracy)
+
+--------------------------------------------------------------------------------
+ TP1 FLAG BITS  (codes 209 / 210, the RF or sub_ms field)
+--------------------------------------------------------------------------------
+   bit 0  (0x01)  ENABLE     time-pulse output enabled
+   bit 1  (0x02)  ISFREQ     value is frequency (Hz); else period (us)
+   bit 2  (0x04)  POL        polarity: rising edge at top-of-second
+   bit 3  (0x08)  ALIGNTOW   align pulse to time-of-week
+   bit 4  (0x10)  LOCKGPS    sync / use GNSS-locked params
+   bit 5  (0x20)  USELOCK    use the *_LOCK values once locked
+   bit 6  (0x40)  ISLENGTH   pulse width is length (us); else duty cycle (%)
+
+   Note: duty cycle is an R8 double on the receiver but the transport is
+   integer-only, so it travels as round(percent * 1000) (TP1_DUTY_SCALE).
+   Only TP1 (tpIdx 0) is exposed by the GUI; TP2 is not controlled.
+
+================================================================================
+ RESERVED / NON-GUI CODES  (ESP -> server telemetry & status; do not reuse)
+================================================================================
+     1   Info code
+    90   Autonomous GPS CPU / health telemetry
+    91   GPS health counts (notice / warn / error; precedes 90)
+    93   Unreasonable request
+    94   Unreasonable request
+    95   Unreasonable request
+    96   Unreasonable request
+    97   Transit time code
+    98   Rate code
+    99   Data code
+   100   Error code
+
+================================================================================
+ Last updated: 2026-06-12   (added duty-cycle to TP1; renumbered 11-20 -> 201-210)
+================================================================================

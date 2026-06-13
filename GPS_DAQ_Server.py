@@ -65,7 +65,7 @@ class CycleLimitReached(Exception):
 
 class RotatingFileWriter:
     def __init__(self, base_folder_name = "folder", base_file_name="file", ext=".txt", time_length = 10, gzip_files=False, header = "", max_cycles = 0):
-        self.base_data_storage_folder = 'C:\\Users\\alexc\\OneDrive\\Desktop\\Claude_GUI_prac\\GPS Data'
+        self.base_data_storage_folder = 'C:\\Users\\alexc\\Desktop\\Claude_GUI_prac\\GPS Data'
         self.base_folder_name = base_folder_name
         self.base_file_name = base_file_name
         self.ext = ext
@@ -352,16 +352,16 @@ def run_server():
                         ctrl_by_id[ID] = s
                         info["id"] = ID
 
-                    if inst in (11, 12, 13, 14, 15, 16, 17, 18):
+                    if inst in (201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211):
                         if ID == GUI_ID:
                             # Command from GUI -> forward to the target ESP's control socket
                             target_id   = RF
                             target_sock = ctrl_by_id.get(target_id)
                             if target_sock:
-                                if inst in (11, 14, 16, 18):  # status/probe/read/version: expect a reply
+                                if inst in (201, 204, 206, 208, 209, 211):  # status/probe/read/version/TP1-read/posllh: expect a reply
                                     pending_slow_ctrl[target_id] = s
                                     fwd = struct.pack(BCAST_FORMAT, inst, 0, 0, 0, 0)
-                                else:                     # 12/13/15/17 carry parameters
+                                else:                     # 202/203/205/207/210 carry parameters
                                     fwd = struct.pack(BCAST_FORMAT, inst, w_num, ms, sub_ms, event_num)
                                 try:
                                     target_sock.sendall(fwd)
@@ -377,7 +377,7 @@ def run_server():
                         else:
                             # Reply / confirmation from an ESP
                             writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                            if inst in (11, 14, 16, 18):
+                            if inst in (201, 204, 206, 208, 209, 211):
                                 gui_sock = pending_slow_ctrl.pop(ID, None)
                                 if gui_sock and gui_sock in sockets:
                                     response = struct.pack(PACKET_FORMAT, inst, ID, RF, Cal, ch, w_num, ms, sub_ms, event_num, count)
@@ -633,7 +633,7 @@ def run_server():
                         else: #For other clients
                             writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
 
-                    elif inst == 11:  # Survey-in status query / response
+                    elif inst == 201:  # Survey-in status query / response
                         if ID == GUI_ID:
                             # Request from GUI: forward to target ESP (RF = target mac_id)
                             print("Survey request")
@@ -641,18 +641,18 @@ def run_server():
                             target_sock = clients_by_id.get(target_id)
                             if target_sock:
                                 pending_slow_ctrl[target_id] = s
-                                fwd = struct.pack(BCAST_FORMAT, 11, 0, 0, 0, 0)
+                                fwd = struct.pack(BCAST_FORMAT, 201, 0, 0, 0, 0)
                                 try:
                                     target_sock.sendall(fwd)
-                                    print(f"[SERVER] inst=11 forwarded to ESP {target_id}")
+                                    print(f"[SERVER] inst=201 forwarded to ESP {target_id}")
                                 except OSError as e:
                                     t_info = clients.get(target_sock)
                                     t_addr = t_info["addr"] if t_info else "Unknown"
                                     cleanup_client_socket(target_sock, t_addr, sockets, clients, clients_by_id)
                             else:
-                                print(f"[SERVER] inst=11: ESP {target_id} not connected")
+                                print(f"[SERVER] inst=201: ESP {target_id} not connected")
                                 with open(writer.error_log, 'a') as f:
-                                    f.write(f"inst=11: ESP {target_id} not connected\n")
+                                    f.write(f"inst=201: ESP {target_id} not connected\n")
                         else:
                             # Response from ESP: log and forward back to waiting GUI
                             print("Survey Reply")
@@ -665,51 +665,51 @@ def run_server():
                                 except OSError:
                                     pass
 
-                    elif inst == 12:  # Start survey-in command / confirmation
+                    elif inst == 202:  # Start survey-in command / confirmation
                         if ID == GUI_ID:
                             # Command from GUI: forward parameters to target ESP
                             target_id   = RF
                             target_sock = clients_by_id.get(target_id)
                             if target_sock:
                                 # w_num=min_dur_s, ms=acc_01mm
-                                fwd = struct.pack(BCAST_FORMAT, 12, w_num, ms, sub_ms, event_num)
+                                fwd = struct.pack(BCAST_FORMAT, 202, w_num, ms, sub_ms, event_num)
                                 try:
                                     target_sock.sendall(fwd)
-                                    print(f"[SERVER] inst=12 (start survey-in) forwarded to ESP {target_id}")
+                                    print(f"[SERVER] inst=202 (start survey-in) forwarded to ESP {target_id}")
                                 except OSError as e:
                                     t_info = clients.get(target_sock)
                                     t_addr = t_info["addr"] if t_info else "Unknown"
                                     cleanup_client_socket(target_sock, t_addr, sockets, clients, clients_by_id)
                             else:
-                                print(f"[SERVER] inst=12: ESP {target_id} not connected")
+                                print(f"[SERVER] inst=202: ESP {target_id} not connected")
                         else:
                             # Confirmation from ESP
                             writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
 
-                    elif inst == 13:  # Set fixed coordinates command / confirmation
+                    elif inst == 203:  # Set fixed coordinates command / confirmation
                         if ID == GUI_ID:
                             # Command from GUI: forward coords to target ESP
                             target_id   = RF
                             target_sock = clients_by_id.get(target_id)
                             if target_sock:
                                 # w_num=X_cm, ms=Y_cm, sub_ms=Z_cm, event_num=acc_01mm
-                                fwd = struct.pack(BCAST_FORMAT, 13, w_num, ms, sub_ms, event_num)
+                                fwd = struct.pack(BCAST_FORMAT, 203, w_num, ms, sub_ms, event_num)
                                 try:
                                     target_sock.sendall(fwd)
-                                    print(f"[SERVER] inst=13 (set fixed coords) forwarded to ESP {target_id}")
+                                    print(f"[SERVER] inst=203 (set fixed coords) forwarded to ESP {target_id}")
                                 except OSError as e:
                                     t_info = clients.get(target_sock)
                                     t_addr = t_info["addr"] if t_info else "Unknown"
                                     cleanup_client_socket(target_sock, t_addr, sockets, clients, clients_by_id)
                             else:
-                                print(f"[SERVER] inst=13: ESP {target_id} not connected")
+                                print(f"[SERVER] inst=203: ESP {target_id} not connected")
                                 with open(writer.error_log, 'a') as f:
-                                    f.write(f"inst=13: ESP {target_id} not connected\n")
+                                    f.write(f"inst=203: ESP {target_id} not connected\n")
                         else:
                             # Confirmation from ESP
                             writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
 
-                    elif inst == 14:  # Probe fixed-position query / response
+                    elif inst == 204:  # Probe fixed-position query / response
                         if ID == GUI_ID:
                             # Request from GUI: forward to target ESP (RF = target mac_id)
                             print("Fixed-position probe request")
@@ -717,18 +717,18 @@ def run_server():
                             target_sock = clients_by_id.get(target_id)
                             if target_sock:
                                 pending_slow_ctrl[target_id] = s
-                                fwd = struct.pack(BCAST_FORMAT, 14, 0, 0, 0, 0)
+                                fwd = struct.pack(BCAST_FORMAT, 204, 0, 0, 0, 0)
                                 try:
                                     target_sock.sendall(fwd)
-                                    print(f"[SERVER] inst=14 forwarded to ESP {target_id}")
+                                    print(f"[SERVER] inst=204 forwarded to ESP {target_id}")
                                 except OSError as e:
                                     t_info = clients.get(target_sock)
                                     t_addr = t_info["addr"] if t_info else "Unknown"
                                     cleanup_client_socket(target_sock, t_addr, sockets, clients, clients_by_id)
                             else:
-                                print(f"[SERVER] inst=14: ESP {target_id} not connected")
+                                print(f"[SERVER] inst=204: ESP {target_id} not connected")
                                 with open(writer.error_log, 'a') as f:
-                                    f.write(f"inst=14: ESP {target_id} not connected\n")
+                                    f.write(f"inst=204: ESP {target_id} not connected\n")
                         else:
                             # Response from ESP: log and forward back to waiting GUI
                             print("Fixed-position probe reply")

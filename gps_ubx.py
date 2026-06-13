@@ -28,6 +28,47 @@ CFG_RATE_NAV     = 0x30210002  # U2: nav rate (measurements per nav solution)
 CFG_RATE_TIMEREF = 0x20210003  # U1/E1: 0=UTC,1=GPS,2=GLONASS,3=BeiDou,4=Galileo
 RATE_KEYS = [CFG_RATE_MEAS, CFG_RATE_NAV, CFG_RATE_TIMEREF]
 
+# ---- CFG-TP keys (time-pulse / PPS).  Only TP1 (tpIdx 0) is exposed. ----
+# Size code in bits 28-30 of the key: 0x1->bit(1B), 0x2->U1(1B), 0x3->I2(2B),
+# 0x4->U4/I4(4B), 0x5->R8(8B).  Duty (R8) is intentionally NOT used — the GUI
+# transport is integer-only, so pulse width is always sent as LENGTH (µs).
+CFG_TP_PULSE_DEF         = 0x20050023  # E1: 0=period (µs), 1=frequency (Hz)
+CFG_TP_PULSE_LENGTH_DEF  = 0x20050030  # E1: 0=ratio/duty, 1=length (µs)
+CFG_TP_ANT_CABLEDELAY    = 0x30050001  # I2: antenna cable delay (ns)
+CFG_TP_PERIOD_TP1        = 0x40050002  # U4: pulse period (µs), unlocked
+CFG_TP_PERIOD_LOCK_TP1   = 0x40050003  # U4: pulse period (µs), GNSS-locked
+CFG_TP_FREQ_TP1          = 0x40050024  # U4: pulse frequency (Hz), unlocked
+CFG_TP_FREQ_LOCK_TP1     = 0x40050025  # U4: pulse frequency (Hz), GNSS-locked
+CFG_TP_LEN_TP1           = 0x40050004  # U4: pulse length (µs), unlocked
+CFG_TP_LEN_LOCK_TP1      = 0x40050005  # U4: pulse length (µs), GNSS-locked
+CFG_TP_DUTY_TP1          = 0x5005002a  # R8: pulse duty cycle (%), unlocked
+CFG_TP_DUTY_LOCK_TP1     = 0x5005002b  # R8: pulse duty cycle (%), GNSS-locked
+CFG_TP_TP1_ENA           = 0x10050007  # L: 1=enable TP1 output
+CFG_TP_SYNC_GNSS_TP1     = 0x10050008  # L: 1=use locked params once GNSS time is in
+CFG_TP_USE_LOCKED_TP1    = 0x10050009  # L: 1=use *_LOCK values when locked
+CFG_TP_ALIGN_TO_TOW_TP1  = 0x1005000a  # L: 1=align pulse to top-of-second
+CFG_TP_POL_TP1           = 0x1005000b  # L: 1=rising edge at top-of-second
+
+TP1_KEYS = [CFG_TP_TP1_ENA, CFG_TP_PULSE_DEF, CFG_TP_PULSE_LENGTH_DEF, CFG_TP_POL_TP1,
+            CFG_TP_ALIGN_TO_TOW_TP1, CFG_TP_SYNC_GNSS_TP1, CFG_TP_USE_LOCKED_TP1,
+            CFG_TP_FREQ_TP1, CFG_TP_FREQ_LOCK_TP1,
+            CFG_TP_PERIOD_TP1, CFG_TP_PERIOD_LOCK_TP1,
+            CFG_TP_LEN_TP1, CFG_TP_LEN_LOCK_TP1,
+            CFG_TP_DUTY_TP1, CFG_TP_DUTY_LOCK_TP1, CFG_TP_ANT_CABLEDELAY]
+
+# TP1 flag bits — shared convention between the GUI, the server and the ESP.
+TP1_F_ENABLE   = 1 << 0   # output enabled
+TP1_F_ISFREQ   = 1 << 1   # value is frequency (Hz); else period (µs)
+TP1_F_POL      = 1 << 2   # polarity: rising edge at top-of-second
+TP1_F_ALIGNTOW = 1 << 3   # align to time-of-week
+TP1_F_LOCKGPS  = 1 << 4   # sync/use GNSS-locked params
+TP1_F_USELOCK  = 1 << 5   # use *_LOCK values when locked
+TP1_F_ISLENGTH = 1 << 6   # pulse width is length (µs); else duty cycle (%)
+
+# Duty cycle (%) is an R8 double on the receiver, but the GUI transport is
+# integer-only — so duty is carried as round(percent * TP1_DUTY_SCALE).
+TP1_DUTY_SCALE = 1000
+
 
 def ubx_msg(cls, id_, payload):
     """Build a complete UBX frame: sync + header + payload + Fletcher checksum."""
@@ -69,7 +110,11 @@ def build_valset(items, layers=0x07):
         elif size == 4:
             payload += ustruct.pack('<i', value)
         elif size == 8:
-            payload += ustruct.pack('<q', value)
+            # 8-byte values are R8 doubles when float, else I8 integers.
+            if isinstance(value, float):
+                payload += ustruct.pack('<d', value)
+            else:
+                payload += ustruct.pack('<q', value)
     return ubx_msg(0x06, 0x8A, payload)
 
 
@@ -142,6 +187,48 @@ def build_rate_set(meas_ms=0, nav_cycles=0, timeref=-1):
     return build_valset(items)
 
 
+def build_tp1_cmd(value, pulse_width, flags, cable_delay_ns):
+    """
+    CFG-VALSET of the TP1 (PPS) keys from the GUI's compact transport.
+      value         : frequency (Hz) if TP1_F_ISFREQ set, else period (µs)
+      pulse_width   : length (µs) if TP1_F_ISLENGTH set, else duty scaled by
+                      TP1_DUTY_SCALE (i.e. round(duty_percent * TP1_DUTY_SCALE))
+      flags         : TP1_F_* bitfield
+      cable_delay_ns: antenna cable delay (ns)
+    Locked and unlocked values are set the same (the integer transport only
+    carries one of each); adjust the *_LOCK split here if that ever changes.
+    """
+    is_freq   = bool(flags & TP1_F_ISFREQ)
+    is_length = bool(flags & TP1_F_ISLENGTH)
+    items = [
+        (CFG_TP_PULSE_DEF,        1 if is_freq   else 0,              1),
+        (CFG_TP_PULSE_LENGTH_DEF, 1 if is_length else 0,              1),
+        (CFG_TP_TP1_ENA,          1 if flags & TP1_F_ENABLE   else 0, 1),
+        (CFG_TP_POL_TP1,          1 if flags & TP1_F_POL      else 0, 1),
+        (CFG_TP_ALIGN_TO_TOW_TP1, 1 if flags & TP1_F_ALIGNTOW else 0, 1),
+        (CFG_TP_SYNC_GNSS_TP1,    1 if flags & TP1_F_LOCKGPS  else 0, 1),
+        (CFG_TP_USE_LOCKED_TP1,   1 if flags & TP1_F_USELOCK  else 0, 1),
+        (CFG_TP_ANT_CABLEDELAY,   cable_delay_ns,                     2),
+    ]
+    if is_freq:
+        items.append((CFG_TP_FREQ_TP1,      value, 4))
+        items.append((CFG_TP_FREQ_LOCK_TP1, value, 4))
+    else:
+        items.append((CFG_TP_PERIOD_TP1,      value, 4))
+        items.append((CFG_TP_PERIOD_LOCK_TP1, value, 4))
+    if is_length:
+        items.append((CFG_TP_LEN_TP1,      pulse_width, 4))
+        items.append((CFG_TP_LEN_LOCK_TP1, pulse_width, 4))
+    else:
+        duty = pulse_width / float(TP1_DUTY_SCALE)   # percent, packed as R8
+        items.append((CFG_TP_DUTY_TP1,      duty, 8))
+        items.append((CFG_TP_DUTY_LOCK_TP1, duty, 8))
+    return build_valset(items)
+
+
 # ---- Monitoring polls (empty-payload UBX-MON requests) ----
 POLL_MON_VER = ubx_msg(0x0A, 0x04, b'')   # software/hardware version strings
 POLL_MON_SYS = ubx_msg(0x0A, 0x39, b'')   # CPU/mem/IO load (F9 firmware with MON-SYS)
+
+# ---- Position poll (NAV-POSLLH: lat/lon/height + 2D/vertical accuracy) ----
+POLL_NAV_POSLLH = ubx_msg(0x01, 0x02, b'')

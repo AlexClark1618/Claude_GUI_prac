@@ -35,7 +35,7 @@ DEVICES = ["BH", "Veto", "Det 1", "Det 2", "Det 3", "Det 4",
 DEVICE_IDS = {
     "BH":    164,
     "Veto":  16,
-    "Det 1": 232,   # placeholder – fill in actual mac_id
+    "Det 1": 116,   # placeholder – fill in actual mac_id
     "Det 2": 0,
     "Det 3": 0,
     "Det 4": 0,

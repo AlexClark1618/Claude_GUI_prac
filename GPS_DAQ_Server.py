@@ -3,22 +3,12 @@ import select
 import struct
 import os
 import re
-from datetime import datetime, timedelta
 import gzip
 import shutil
 import time
 import traceback
 import errno
-import datetime
-
-#Changelog:
-    #11/14/25- Added socket cleanup function to remove deadsockets
-    #Better handled nonblocking send and receive functions with appropriate error catching. SHould hopefully reduce errors.
-    #Borehole and veto are broadcasting to eachother filling up TCP socket. Added a recv in each esp code to clear the buffer. Too complicated (as I see) to try and deal with it server side.
-    #12/2/25- Event numbers now generated on server
-
-
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 GPS_UTC_OFFSET = 18  # leap seconds (valid as of 2026)
 
@@ -48,7 +38,6 @@ def gps_to_utc_seconds(gps_week: int, ms_of_week: int, ns_remainder: int) -> flo
 
 HOST = '0.0.0.0'
 PORT = 12345
-UDP_PORT = 12346
 CTRL_PORT = 12347   # dedicated slow-control channel (survey/fix), separate from the data stream
 
 GUI_ID = 1  # Reserved ID for the slow-control GUI
@@ -65,7 +54,7 @@ class CycleLimitReached(Exception):
 
 class RotatingFileWriter:
     def __init__(self, base_folder_name = "folder", base_file_name="file", ext=".txt", time_length = 10, gzip_files=False, header = "", max_cycles = 0):
-        self.base_data_storage_folder = 'C:\\Users\\alexc\\Desktop\\Claude_GUI_prac\\GPS Data'
+        self.base_data_storage_folder = "C:\\Users\\alexc\\Desktop\\Claude_GUI_prac\\GPS Data"
         self.base_folder_name = base_folder_name
         self.base_file_name = base_file_name
         self.ext = ext
@@ -81,8 +70,9 @@ class RotatingFileWriter:
         self.folder_dir = self.open_new_folder()
         self.connection_log = os.path.join(self.folder_dir, "connection_log.txt")
         self.error_log = os.path.join(self.folder_dir, "error_log.txt")
-        self.unique_esp_log = os.path.join(self.folder_dir, "unique_esp_log.txt")
+        self.device_log = os.path.join(self.folder_dir, "device_log.txt")
         self.cpu_log = os.path.join(self.folder_dir, "gps_cpu_log.txt")
+        self.stats_log = os.path.join(self.folder_dir, "stats_log.txt")
         with open(self.cpu_log, 'a') as f:
             f.write("timestamp; ID; cpuLoad; cpuLoadMax; memUsage; memUsageMax; "
                     "ioUsage; ioUsageMax; runTime_s; temp_C; notice; warn; error\n")
@@ -166,17 +156,6 @@ class RotatingFileWriter:
         if self.file:
             self._close_and_gzip()
 
-"""def cleanup_client_socket(sock, addr, sockets, clients):
-    if sock in sockets:
-        sockets.remove(sock)
-    if sock in clients:
-        del clients[sock]
-    sock.close()
-
-    with open(writer.connection_log, 'a') as log:
-        log.write(f"{time.time()}: Disconnected from {addr}\n")
-    print(f"[SERVER] Dead client socket removed: {addr}")
-"""
 def cleanup_client_socket(sock, addr, sockets, clients, clients_by_id):
 
     if sock in sockets:
@@ -233,11 +212,6 @@ def run_server():
     server.listen()
     server.setblocking(False)
 
-    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    udp_sock.bind((HOST, UDP_PORT))
-    udp_sock.setblocking(False)
-
     # Dedicated control listener (survey/fix commands) — kept off the data stream
     ctrl_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     ctrl_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -245,19 +219,16 @@ def run_server():
     ctrl_server.listen()
     ctrl_server.setblocking(False)
 
-    print(f"[SERVER] UDP listening on {HOST}:{UDP_PORT}")
     print(f"[SERVER] Server listening on {HOST}:{PORT}")
     print(f"[SERVER] Control listening on {HOST}:{CTRL_PORT}")
 
-    sockets = [server, udp_sock, ctrl_server]  # includes all connected sockets
+    sockets = [server, ctrl_server]  # includes all connected sockets
     clients = {}        # map client socket -> {'buffer': bytearray, 'id': int}
-    clients_by_id = {}
+    clients_by_id = {}  #maps esp mac ID to socket
 
     ctrl_clients = {}   # map control socket -> {'buffer': bytearray, 'addr': ..., 'id': int}
     ctrl_by_id = {}     # map esp mac_id -> its control socket
     cpu_extra = {}      # map esp mac_id -> (notice, warn, error) from the latest inst=91
-
-    udp_clients = set()
 
     last_time = 0
     esp_unique_ID_list = []
@@ -268,7 +239,6 @@ def run_server():
     # Slow-control routing: maps esp_mac_id -> gui_socket waiting for the reply
     pending_slow_ctrl = {}
 
-    rx_buffer = bytearray()
     while True:
 
         if int(time.time())%60==0 and int(time.time())!=last_time: #To let you know server is running
@@ -290,9 +260,6 @@ def run_server():
                         "buffer": bytearray(),
                         "addr": addr
                     }
-
-                    if addr[0] == '134.69.77.98':
-                        udp_clients.add((addr[0], 12346))
 
                     print(f"[SERVER] New ESP32 connected from {addr}")
                     with open(writer.connection_log, 'a') as log:
@@ -388,9 +355,7 @@ def run_server():
 
                     elif inst == 91:  # GPS health counts (sent right before inst=90)
                         cpu_extra[ID] = (RF, Cal, ch)   # notice, warn, error
-                        print("Inst 91 found")
                     elif inst == 90:  # autonomous GPS CPU/health telemetry from an ESP
-                        print("Inst 90 found")
                         # RF=cpuLoad Cal=memUsage ch=ioUsage w_num=temp
                         # ms=cpuLoadMax sub_ms=memUsageMax event_num=ioUsageMax count=runTime
                         notice, warn, error = cpu_extra.get(ID, (0, 0, 0))
@@ -407,11 +372,16 @@ def run_server():
 
             else: #Reads client data
                 client_info = clients.get(s)
-                client_addr = client_info["addr"] if client_info else None
+                # An earlier socket in this same select() pass may have triggered a
+                # reconnect cleanup that closed and removed THIS socket (an ESP's
+                # stale old connection). If so, it's gone from `clients` -- skip it,
+                # otherwise clients[s] below raises KeyError on a [closed] socket.
+                if client_info is None:
+                    continue
+                client_addr = client_info["addr"]
                 try:
                     data = s.recv(2048)
                     if not data:  # empty = client closed connection
-                        #cleanup_client_socket(s, client_addr, sockets, clients)
                         cleanup_client_socket(s, client_addr, sockets, clients, clients_by_id)
                         continue
 
@@ -425,23 +395,19 @@ def run_server():
                         with open(writer.error_log, 'a') as f:
                             f.write(f"[SERVER] Error Receiving from {client_addr}: {e}\n")
 
-
-                        #cleanup_client_socket(s, client_addr, sockets, clients)
                         cleanup_client_socket(s, client_addr, sockets, clients, clients_by_id)
-
                         continue
 
-                clients[s]["buffer"].extend(data)
-                T0 = time.time()
+                client_info["buffer"].extend(data)
                 # Packet buffer to handle multiple packets at the same time
-                while len(clients[s]["buffer"]) >= PACKET_SIZE:
-                    packet = clients[s]["buffer"][:PACKET_SIZE]
-                    clients[s]["buffer"] = clients[s]["buffer"][PACKET_SIZE:]
+                while len(client_info["buffer"]) >= PACKET_SIZE:
+                    packet = client_info["buffer"][:PACKET_SIZE]
+                    client_info["buffer"] = client_info["buffer"][PACKET_SIZE:]
 
                     #Unpacks data
                     inst, ID, RF, Cal, ch, w_num, ms, sub_ms, event_num, count = struct.unpack(PACKET_FORMAT, packet)
                     
-                    if clients[s].get("id") != ID:
+                    if client_info.get("id") != ID:
                         existing_sock = clients_by_id.get(ID)
 
                         if existing_sock is not None and existing_sock != s:
@@ -453,9 +419,15 @@ def run_server():
                             #cleanup_client_socket(existing_sock, old_addr, sockets, clients)
                             cleanup_client_socket(existing_sock, old_addr, sockets, clients, clients_by_id)
                         clients_by_id[ID] = s
-                        clients[s]["id"] = ID
+                        client_info["id"] = ID
 
                     if inst == 1: #Info Code
+                        if ID not in esp_unique_ID_list:
+                            esp_unique_ID_list.append(ID)
+                            with open(writer.device_log, 'a') as log:
+                                log.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+
+                        #Write in connection log to    
                         with open(writer.connection_log, 'a') as log:
                             log.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
 
@@ -464,46 +436,46 @@ def run_server():
                         with open(writer.error_log, 'a') as f:
                             f.write(f"[ESP]:{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n") # Ignore labels; RF = Error Code
 
-                    elif inst == 95: #Unreasonable Request
-                        writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                    elif inst in (93, 94, 95, 96, 97, 98):
+                        ###
+
+                        if inst == 97:
+                            if ID == 48:
+                                try:
+                                    event_num = prev_event_num_BH 
+                                    #writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                                    with open(writer.stats_log, 'a') as log:
+                                        log.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+
+                                    #gps_to_utc = gps_to_utc_seconds(w_num, ms, sub_ms)
+                                    #print("BH transit time:", (time.time()-gps_to_utc)*1000)
+                                except Exception:
+                                    pass
+
+                            elif ID == 16:
+                                try:
+                                    event_num = event_num_veto #I think this must be due to how the code is on the esp
+                                    with open(writer.stats_log, 'a') as log:
+                                        log.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                                    #writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                                except Exception:
+                                    pass
                     
-                    elif inst == 94: #Unreasonable Request
-                        writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-
-                    elif inst == 93: #Unreasonable Request
-                         writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-
-                    elif inst == 96: #Unreasonable Request
-                        writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-
-                    elif inst == 97: #Transit Time Code
-
-                        if ID == 48:
-                            try:
-                                event_num = prev_event_num_BH 
-                                writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-
-                                #gps_to_utc = gps_to_utc_seconds(w_num, ms, sub_ms)
-                                #print("BH transit time:", (time.time()-gps_to_utc)*1000)
-                            except Exception:
-                                pass
-                        elif ID == 16:
-                            try:
-                                event_num = event_num_veto #I think this must be due to how the code is on the esp
-                                writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                            except Exception:
-                                pass
+                            else:
+                                with open(writer.stats_log, 'a') as log:
+                                    log.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                  
                         else:
-                            writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                            with open(writer.stats_log, 'a') as log:
+                                log.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
 
-                    elif inst == 98: #Rate Code
-                        writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                        
                     elif inst == 99: #Data Code
+                        '''
                         if ID not in esp_unique_ID_list:
                             esp_unique_ID_list.append(ID)
                             with open(writer.unique_esp_log, 'a') as f:
                                 f.write(f"{str(ID)}\n")
+                        '''
 
                         if ID == 164:
                             
@@ -515,25 +487,23 @@ def run_server():
                                 event_num_BH+=1
 
                                 rise_BH_timestamp = ns_timestamp(ms, sub_ms)
-                                
-                                
+
+
                                 for client_ID in list(clients_by_id.keys()):
 
                                     if client_ID not in (164, 16, GUI_ID):
                                         client_sock = clients_by_id.get(client_ID)
-                                        
+
                                         if client_sock is None:
                                             continue
-                                        
+
                                         client_info = clients.get(client_sock)
                                         client_addr = client_info["addr"] if client_info else "Unknown"
-                                  
-                                        try:
-                                            broadcast_format = '!iiiii'
-                                            broadcast_packet = struct.pack(broadcast_format, inst, w_num, ms, sub_ms, event_num)
 
-                                            broadcast = client_sock.sendall(broadcast_packet)
-                
+                                        try:
+                                            broadcast_packet = struct.pack(BCAST_FORMAT, inst, w_num, ms, sub_ms, event_num)
+                                            client_sock.sendall(broadcast_packet)
+
                                         except OSError as e:
                                             if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                                                 # Error can be skipped
@@ -543,17 +513,12 @@ def run_server():
                                                 print(f"[SERVER] Send Error to {client_addr}: {e}")
                                                 with open(writer.error_log, 'a') as f:
                                                     f.write(f"[SERVER] Send Error to {client_addr}: {e}\n")
-                                                
-                                                #cleanup_client_socket(client_sock, client_addr, sockets, clients)
+
                                                 cleanup_client_socket(client_sock, client_addr, sockets, clients, clients_by_id)
 
                                                 continue
-                                
-                                for udp_addr in udp_clients:
-                                    
-                                    udp_sock.sendto(broadcast_packet, udp_addr)
 
-                            if ch == 0 and RF == 1: 
+                            if ch == 0 and RF == 1:
 
                                 fall_BH_timestamp = ns_timestamp(ms,sub_ms)
                                 
@@ -581,24 +546,23 @@ def run_server():
 
                                 event_num_veto-=1
 
-                                rise_veto_timestamp = ns_timestamp(ms, sub_ms)    
+                                rise_veto_timestamp = ns_timestamp(ms, sub_ms)
 
                                 for client_ID in list(clients_by_id.keys()):
 
                                     if client_ID not in (128, 16, GUI_ID):
                                         client_sock = clients_by_id.get(client_ID)
-                                        
+
                                         if client_sock is None:
                                             continue
 
                                         client_info = clients.get(client_sock)
                                         client_addr = client_info["addr"] if client_info else "Unknown"
-                                        try:
-                                            broadcast_format = '!iiiii'
-                                            broadcast_packet = struct.pack(broadcast_format, inst, w_num, ms, sub_ms, event_num)
 
-                                            broadcast = client_sock.sendall(broadcast_packet)
-                                                                                                
+                                        try:
+                                            broadcast_packet = struct.pack(BCAST_FORMAT, inst, w_num, ms, sub_ms, event_num)
+                                            client_sock.sendall(broadcast_packet)
+
                                         except OSError as e:
                                             if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                                                 # Error can be skipped
@@ -608,13 +572,12 @@ def run_server():
                                                 print(f"[SERVER] Send Error to {client_addr}: {e}")
                                                 with open(writer.error_log, 'a') as f:
                                                     f.write(f"[SERVER] Send Error to {client_addr}: {e}\n")
-                                                
-                                                #cleanup_client_socket(client_sock, client_addr, sockets, clients)
+
                                                 cleanup_client_socket(client_sock, client_addr, sockets, clients, clients_by_id)
 
                                                 continue
 
-                            if ch == 0 and RF == 1: 
+                            if ch == 0 and RF == 1:
 
                                 fall_veto_timestamp = ns_timestamp(ms,sub_ms)
 
@@ -752,8 +715,6 @@ def run_server():
 
                         break
 
-            
-
 if __name__ == "__main__":
 
     import argparse
@@ -800,209 +761,3 @@ if __name__ == "__main__":
     finally:
         writer.close()
 
-
-"""
-            if s is udp_sock:
-                try:
-                    data, addr = udp_sock.recvfrom(2048)
-                    #print(udp_sock)
-                    if addr[0] == "134.69.77.82" and data:  # Only accept trigger ESP
-
-                        if len(data) % PACKET_SIZE != 0:
-                            print("Corrupt UDP packet size:", len(data))
-                            continue
-                        
-                        for pack_step in range(0, len(data), PACKET_SIZE):
-                            packet = data[pack_step:pack_step + PACKET_SIZE]    
-                                                  
-                            inst, ID, RF, Cal, ch, w_num, ms, sub_ms, event_num, count = struct.unpack(PACKET_FORMAT, packet)
-
-                            if inst == 1: #Info Code
-                                with open(writer.connection_log, 'a') as log:
-                                    log.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-
-                            elif inst == 100: #Error code
-                                #writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                                with open(writer.error_log, 'a') as f:
-                                    f.write(f"[ESP]:{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n") # Ignore labels; RF = Error Code
-
-                            elif inst == 97: #Transit Time Code
-
-                                if ID == 48:
-                                    try:
-                                        event_num = prev_event_num_BH 
-                                        writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-
-                                        gps_to_utc = gps_to_utc_seconds(w_num, ms, sub_ms)
-                                        #rint("BH transit time:", (time.time()-gps_to_utc)*1000)
-                                    except Exception:
-                                        pass
-                                    
-                                elif ID == 16:
-                                    try:
-                                        event_num = event_num_veto #I think this must be due to how the code is on the esp
-                                        writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                                    except Exception:
-                                        pass
-                                else:
-                                    writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-
-                            elif inst == 98: #Rate Code
-                                writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                                
-                            elif inst == 99: #Data Code
-                                if ID not in esp_unique_ID_list:
-                                    esp_unique_ID_list.append(ID)
-                                    with open(writer.unique_esp_log, 'a') as f:
-                                        f.write(f"{str(ID)}\n")
-
-                                if ID == 48:
-                                    #event_num = event_num_BH
-                                    #print(type(ms))
-                                    #writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                                    #print("BH data written to file")
-                                    #T0 = time.time()
-                                    
-                                    if ch == 0 and RF == 0: #Measuring time from rise  
-                                        event_num = event_num_BH
-                                        prev_event_num_BH = event_num_BH
-                                        writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-
-                                        event_num_BH+=1
-
-                                        rise_BH_timestamp = ns_timestamp(ms, sub_ms)
-                                        
-                                        #T0 = time.time()
-                                        for client_sock in list(clients.keys()):
-                                            if client_sock != s: #Broadcasts BH timestamp to all other clients except sender
-                                                
-                                                client_info = clients.get(client_sock)
-                                                client_addr = client_info["addr"] if client_info else "Unknown"
-                                                #print(client_addr)
-                                                if client_addr[0]!="134.69.77.98":                                     
-                                                    try:
-                                                        #time.sleep(0.1) #delay the broadcast by 100ms
-                                                        broadcast_format = '!iiiii'
-                                                        broadcast_packet = struct.pack(broadcast_format, inst, w_num, ms, sub_ms, event_num)
-
-                                                    
-                                                        
-                                                        broadcast = client_sock.sendall(broadcast_packet)
-                                                        #print("T0:", T0)
-                                                        #print(time.time())
-                                                        #print(f'{(time.time()-T0)*1000}, {client_addr}')
-                                                                                                            
-                                                            #print(f'Request for data sent:{broadcast}')
-                            
-                                                    except OSError as e:
-                                                        if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                                                            # Error can be skipped
-                                                            continue
-
-                                                        else:  # ECONNRESET or other fatal error
-                                                            print(f"[SERVER] Send Error to {client_addr}: {e}")
-                                                            with open(writer.error_log, 'a') as f:
-                                                                f.write(f"[SERVER] Send Error to {client_addr}: {e}\n")
-                                                            
-                                                            #cleanup_client_socket(client_sock, client_addr, sockets, clients)
-                                                            cleanup_client_socket(client_sock, client_addr, sockets, clients, clients_by_id)
-
-                                                            continue
-                                            
-                                        for udp_addr in udp_clients:
-                                            
-                                            udp_sock.sendto(broadcast_packet, udp_addr)
-                                            
-                                    if ch == 0 and RF == 1: 
-
-                                        fall_BH_timestamp = ns_timestamp(ms,sub_ms)
-                                        
-                                        try:
-                                            if abs(rise_BH_timestamp-fall_BH_timestamp)<5000:
-
-                                                event_num = prev_event_num_BH
-                                                writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                                        except Exception:
-                                            pass
-
-                                    if ch == 1:
-                                        try:
-                                            event_num = prev_event_num_BH
-                                            writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                                        except Exception:
-                                            pass
-
-                                elif ID == 16:
-                                #event_num = event_num_veto
-                                #writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                                #print("BH data written to file")
-                                
-                                    if ch == 0 and RF == 0: #Measuring time from rise     
-                                        event_num = event_num_veto
-                                        prev_event_num_veto = event_num_veto
-                                        writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-
-                                        event_num_veto-=1
-
-                                        rise_veto_timestamp = ns_timestamp(ms, sub_ms)    
-                                                            
-                                        for client_sock in list(clients.keys()):
-                                            #if client_sock.fileno() == -1:
-                                                
-                                            if client_sock != s: #Broadcasts BH timestamp to all other clients except sender
-                                                
-                                                client_info = clients.get(client_sock)
-                                                client_addr = client_info["addr"] if client_info else "Unknown"
-                                                try:
-                                                    #time.sleep(0.1) #delay the broadcast by 100ms
-                                                    broadcast_format = '!iiiii'
-                                                    broadcast_packet = struct.pack(broadcast_format, inst, w_num, ms, sub_ms, event_num)
-                                                    
-                                                    if client_addr[0] == '134.69.77.98':
-                                                        udp_sock.sendto(broadcast_packet, (client_addr[0], 12346))
-                                                    
-                                                    else:
-                                                        broadcast = client_sock.sendall(broadcast_packet)
-                                                                                                        
-                                                    #print(f'Request for data sent:{broadcast}')
-                            
-                                                except OSError as e:
-                                                    if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                                                        # Error can be skipped
-                                                        continue
-
-                                                    else:  # ECONNRESET or other fatal error
-                                                        print(f"[SERVER] Send Error to {client_addr}: {e}")
-                                                        with open(writer.error_log, 'a') as f:
-                                                            f.write(f"[SERVER] Send Error to {client_addr}: {e}\n")
-                                                        
-                                                        #cleanup_client_socket(client_sock, client_addr, sockets, clients)
-                                                        cleanup_client_socket(client_sock, client_addr, sockets, clients, clients_by_id)
-
-                                                        continue
-
-                                    if ch == 0 and RF == 1: 
-
-                                        fall_veto_timestamp = ns_timestamp(ms,sub_ms)
-
-                                        if abs(rise_veto_timestamp-fall_veto_timestamp)<5000:
-
-                                            event_num = prev_event_num_veto
-                                            writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                                        
-
-                                    else: #For other clients
-                                        writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-
-                            else:
-                                #writer.write("Unknown Code\n")
-                                #    
-                                with open(writer.error_log, 'a') as f:
-                                    f.write(f"Unknown Code from client {client_addr}\n")
-
-                                clients[s]["buffer"].clear()
-                                print(f"Buffer cleared from client {client_addr}")
-
-
-                except OSError:
-                    continue"""

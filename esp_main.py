@@ -1181,7 +1181,6 @@ while ((slope == 0) or (tRaw1 == None) or (Valid == 0)):
         send_data(packet)
         continue
 '''
-null_count = 0
 NEventsSent0=0
 NEventsSent1=0
 NEventsSentBoth = 0
@@ -1227,8 +1226,11 @@ loop_time_max = 0
 proc_time_avg = 0
 proc_time_max = 0
 
+#----- Telemetry for wifi integrity -----
+rx_count = 0 #Number of requests for data received
+data_count = 0
+null_count = 0
 
-rx_count = 0
 req_diff = 0
 prev_req = 0
 
@@ -1307,12 +1309,11 @@ while True:
             while recv_index + rx_packet_size <= len(recv_chunk):
                 service_control()   # service control between each (slow ~1.2s) data request
 
-                rx_count +=1
+                rx_count +=1 #Counts number of receives
 
                 recv_packet = recv_chunk[recv_index:recv_index+rx_packet_size]
                 recv_index += rx_packet_size
                 
-                #print("Rx:", len(req))
                 ch0_flag = 0
                 ch1_flag = 0
                 ch0_data_flag = 0
@@ -1333,7 +1334,6 @@ while True:
                 
                 except Exception as e:
                     print("Error unpacking request:", e)
-                    #error_msg = (100, mac_id, 11, 0, 0, 0, 0, 0, 0, 0)
                     packet = data_packing(send_packet_format, 100, mac_id, 11, 0, 0, 0, 0, 0, 0, 0)
                     send_data(packet)
                     continue
@@ -1354,7 +1354,7 @@ while True:
                     proc_time_avg += proc_time                 
                     
                     if toi_len == 0 or timesofinterest is None:
-                        null_count += 1
+                        null_count += 1 #Counts nulls per request
                         pass
                     
                     else:
@@ -1399,7 +1399,8 @@ while True:
                             NEventsSentBoth += 1
 
                         data = send_data(send_mv[:send_buffer_index])
-                        #if data:
+                        if data:
+                            data_count += 1 #Counts how many requests result in data sent
                             #print("!!!!!!!!!!!!!!!!!!!!!data sent", data)
                         send_buffer_index = 0
 
@@ -1420,19 +1421,21 @@ while True:
                         stats_send_buffer_index += tx_packet_size
                        
                         if rx_count>0 and recv_chunk_count>0:
-                            stats_msg2 = (97, mac_id, transit_time_avg//rx_count, transit_time_max, request_bunching_avg//recv_chunk_count, request_bunching_max, unreas_count, rx_count, 0, 0)
+                            stats_msg2 = (97, mac_id, transit_time_avg//rx_count, transit_time_max, request_bunching_avg//recv_chunk_count, request_bunching_max, proc_time_avg//rx_count, proc_time_max, loop_time_avg//recv_chunk_count, loop_time_max)
                             ustruct.pack_into(send_packet_format, send_stats_mv, stats_send_buffer_index, *stats_msg2)
                             stats_send_buffer_index += tx_packet_size
 
+                            '''
                             stats_msg3 = (96, mac_id, proc_time_avg//rx_count, proc_time_max, loop_time_avg//recv_chunk_count, loop_time_max, 0, 0, 0, 0)
                             ustruct.pack_into(send_packet_format, send_stats_mv, stats_send_buffer_index, *stats_msg3)
                             stats_send_buffer_index += tx_packet_size
+                            '''
 
-                        stats_msg4 = (95, mac_id, null_count, unreas_count, 0, 0, 0, 0, 0, 0)
+                        stats_msg4 = (96, mac_id, rx_count, data_count, null_count, unreas_count, 0, 0, 0, 0, 0, 0)
                         ustruct.pack_into(send_packet_format, send_stats_mv, stats_send_buffer_index, *stats_msg4)
                         stats_send_buffer_index += tx_packet_size
                        
-                        stats_msg5 = (94, mac_id, NEventsSent0, NEventsSent1, deltaT, wno, Ms, subMs, NEventsSentBoth, null_count)
+                        stats_msg5 = (95, mac_id, NEventsSent0, NEventsSent1, deltaT, wno, Ms, subMs, NEventsSentBoth, 0)
                         ustruct.pack_into(send_packet_format, send_stats_mv, stats_send_buffer_index, *stats_msg5)
                         stats_send_buffer_index += tx_packet_size
                     except Exception:
@@ -1440,7 +1443,7 @@ while True:
                         pass
 
                     #Clear variables
-                    NEvents0=NEvents1=NEventsSent0=NEventsSent1=deltaT=ch0_null_count=ch1_null_count=NEventsSentBoth= rx_count = unreas_count = null_count= 0
+                    NEvents0=NEvents1=NEventsSent0=NEventsSent1=deltaT=ch0_null_count=ch1_null_count=NEventsSentBoth= rx_count = unreas_count = null_count= data_count = 0
                     request_bunching_avg = 0
                     request_bunching_max = 0
                     recv_chunk_count = 0

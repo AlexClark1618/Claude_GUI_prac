@@ -54,7 +54,7 @@ class CycleLimitReached(Exception):
 
 class RotatingFileWriter:
     def __init__(self, base_folder_name = "folder", base_file_name="file", ext=".txt", time_length = 10, gzip_files=False, header = "", max_cycles = 0):
-        self.base_data_storage_folder = "C:\\Users\\alexc\\Desktop\\Claude_GUI_prac\\GPS Data"
+        self.base_data_storage_folder = "C:\\Users\\aclark2\\Desktop\\Claude_GUI_prac\\GPS Data"
         self.base_folder_name = base_folder_name
         self.base_file_name = base_file_name
         self.ext = ext
@@ -124,9 +124,13 @@ class RotatingFileWriter:
             self.file.write(self.header + "\n") 
 
         print(f"[INFO] Opened {self.filename}")
+
+        #Delimit by Cycle Number
         with open(self.connection_log, 'a') as cl:
             cl.write(f"\nStart Cycle {self.cycle_number}:{datetime.now()}\n")
         with open(self.error_log, 'a') as el:
+            el.write(f"\nStart Cycle {self.cycle_number}:{datetime.now()}\n")
+        with open(self.stats_log, 'a') as el:
             el.write(f"\nStart Cycle {self.cycle_number}:{datetime.now()}\n")
 
         self.cycle_number += 1
@@ -445,7 +449,7 @@ def run_server():
                                     event_num = prev_event_num_BH 
                                     #writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
                                     with open(writer.stats_log, 'a') as log:
-                                        log.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                                        log.write(f"{datetime.now()}; {inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
 
                                     #gps_to_utc = gps_to_utc_seconds(w_num, ms, sub_ms)
                                     #print("BH transit time:", (time.time()-gps_to_utc)*1000)
@@ -456,18 +460,18 @@ def run_server():
                                 try:
                                     event_num = event_num_veto #I think this must be due to how the code is on the esp
                                     with open(writer.stats_log, 'a') as log:
-                                        log.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                                        log.write(f"{datetime.now()}; {inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
                                     #writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
                                 except Exception:
                                     pass
                     
                             else:
                                 with open(writer.stats_log, 'a') as log:
-                                    log.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                                    log.write(f"{datetime.now()}; {inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
                   
                         else:
                             with open(writer.stats_log, 'a') as log:
-                                log.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                                log.write(f"{datetime.now()}; {inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
 
                     elif inst == 99: #Data Code
                         '''

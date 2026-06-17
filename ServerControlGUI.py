@@ -9,18 +9,19 @@ import socket
 import struct
 import time
 from datetime import datetime
+from collections import defaultdict, deque
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-SERVER_SCRIPT = r"C:\\Users\\alexc\\Desktop\\Claude_GUI_prac\\GPS_DAQ_Server.py"
+SERVER_SCRIPT = r"C:\\Users\\aclark2\\Desktop\\Claude_GUI_prac\\GPS_DAQ_Server.py"
 SERVER_CWD = os.path.dirname(SERVER_SCRIPT)
 GPS_DATA_DIR = os.path.join(SERVER_CWD, "GPS Data")
 SURVEY_RESULTS_DIR = os.path.join(SERVER_CWD, "Survey Results")
 
 # Shell used by the OTA interactive terminal.  A persistent process is spawned
 # so working directory / environment changes carry over between commands.
-#!!!hange to terminal exe for linux systems!!!
+#!!!Change to terminal exe for linux systems!!!
 OTA_SHELL = ["powershell.exe", "-NoLogo", "-NoProfile", "-Command", "-"]
 
 PACKET_FORMAT = "!iiiiiiiiii"
@@ -69,6 +70,17 @@ TP1_DUTY_SCALE = 1000     # duty % carried as round(percent * scale)
 # 6 ioUsage 7 ioUsageMax 8 runTime 9 temp 10 notice 11 warn 12 error
 PLOT_METRICS = {"CPU load (%)": 2, "Mem usage (%)": 4, "IO usage (%)": 6, "Temp (°C)": 9}
 
+# stats_log.txt — data slow control.  Two on-disk layouts are handled:
+#   future:  ts; inst; ID; d0; d1; d2; d3; d4; d5; d6; d7   (11 fields, datetime first)
+#   current:     inst; ID; d0; d1; d2; d3; d4; d5; d6; d7   (10 fields, no datetime)
+# Cycle delimiter / header lines ("Start Cycle N:...") are skipped by the parser.
+#   inst 98 (rate in):   d0=NEvents0   d1=NEvents1   d2=deltaT(ms)
+#   inst 96 (integrity): d0=rx_count   d1=data_count d2=null_count  d3=unreas_count
+# The file grows without bound, so the GUI reads it incrementally (byte offset)
+# and keeps only the most recent STATS_MAX_POINTS samples per detector in memory.
+STATS_MAX_POINTS = 3000
+ID_TO_NAME = {v: k for k, v in DEVICE_IDS.items() if v}
+
 
 class GPSDAQApp:
     def __init__(self, root):
@@ -81,6 +93,10 @@ class GPSDAQApp:
         self.ota_process = None
         self.autosurvey_stop = threading.Event()
         self.autosurvey_thread = None
+
+        # Data slow control: incremental-read state (see _update_datactrl)
+        self._stats_path = None
+        self._reset_stats_state()
 
         self._build_ui()
 
@@ -110,6 +126,7 @@ class GPSDAQApp:
         server_tab = tk.Frame(self.notebook)
         gps_tab    = tk.Frame(self.notebook)
         cpu_tab    = tk.Frame(self.notebook)
+        data_tab   = tk.Frame(self.notebook)
         auto_tab   = tk.Frame(self.notebook)
         ota_tab    = tk.Frame(self.notebook)
         pps_tab = tk.Frame(self.notebook)
@@ -117,6 +134,7 @@ class GPSDAQApp:
         self.notebook.add(server_tab, text="  Server Control  ")
         self.notebook.add(gps_tab,    text="  GPS Comms ")
         self.notebook.add(cpu_tab,    text="  GPS Slow Control  ")
+        self.notebook.add(data_tab,   text="  Data Slow Control  ")
         self.notebook.add(auto_tab,   text="  Auto Survey  ")
         self.notebook.add(pps_tab,    text="  PPS Controls  ")
         self.notebook.add(ota_tab,    text="  OTA  ")
@@ -124,6 +142,7 @@ class GPSDAQApp:
         self._build_server_tab(server_tab)
         self._build_gps_tab(gps_tab)
         self._build_slowctrl_tab(cpu_tab)
+        self._build_datactrl_tab(data_tab)
         self._build_autosurvey_tab(auto_tab)
         self._build_ppsctrl_tab(pps_tab)
         self._build_ota_tab(ota_tab)
@@ -868,6 +887,238 @@ class GPSDAQApp:
             pass
         finally:
             self.root.after(3000, self._update_slowctrl)
+
+    # ================================================================== #
+    #  Tab 4 – Data Slow Control (per-detector rates + wifi integrity)
+    # ================================================================== #
+
+    def _build_datactrl_tab(self, parent):
+        ctl = tk.Frame(parent)
+        ctl.pack(fill="x", padx=8, pady=(6, 2))
+
+        tk.Label(ctl, text="Stats for detector:").pack(side="left")
+        self.data_unit_var = tk.StringVar(value="—")
+        self.data_unit_combo = ttk.Combobox(ctl, textvariable=self.data_unit_var,
+                                             values=[], state="readonly", width=14)
+        self.data_unit_combo.pack(side="left", padx=4)
+        # display-string -> detector id, rebuilt on every refresh
+        self._data_disp_to_id = {}
+
+        # Two stacked plots: observed rate (top) and wifi integrity (bottom).
+        self.data_fig = Figure(figsize=(6, 4.6), dpi=100)
+        self.data_ax_rate = self.data_fig.add_subplot(211)
+        self.data_ax_integ = self.data_fig.add_subplot(212)
+        self.data_canvas = FigureCanvasTkAgg(self.data_fig, master=parent)
+        self.data_canvas.get_tk_widget().pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+        # Latest-values readout for the selected detector
+        stats = tk.LabelFrame(parent, text="Latest stats (selected detector)", padx=8, pady=4)
+        stats.pack(fill="x", padx=8, pady=(0, 8))
+        self.data_stat_vars = {}
+        labels = ["Ch0 (Hz)", "Ch1 (Hz)", "Total (Hz)", "Wifi integrity", "Unreas %"]
+        for i, name in enumerate(labels):
+            tk.Label(stats, text=name, font=("Arial", 8), fg="#444").grid(row=0, column=i, padx=8)
+            v = tk.StringVar(value="—")
+            tk.Label(stats, textvariable=v, font=("Arial", 10, "bold")).grid(row=1, column=i, padx=8)
+            self.data_stat_vars[name] = v
+
+        self._update_datactrl()
+
+    def _reset_stats_state(self):
+        """Clear the incremental-read buffers (new run, rotation, or first use)."""
+        self._stats_offset = 0
+        self._stats_rate = defaultdict(lambda: deque(maxlen=STATS_MAX_POINTS))
+        self._stats_integ = defaultdict(lambda: deque(maxlen=STATS_MAX_POINTS))
+
+    def _latest_stats_log(self):
+        """Path to stats_log.txt in the highest-numbered run folder, or None."""
+        best, best_n = None, -1
+        try:
+            for name in os.listdir(GPS_DATA_DIR):
+                m = re.match(r"Run_(\d+)_", name)
+                p = os.path.join(GPS_DATA_DIR, name)
+                if m and os.path.isdir(p):
+                    n = int(m.group(1))
+                    if n > best_n:
+                        best_n, best = n, os.path.join(p, "stats_log.txt")
+        except OSError:
+            pass
+        return best
+
+    @staticmethod
+    def _parse_stats_line(line):
+        """Parse one stats_log line into (inst, det_id, ts_or_None, data[0:8]).
+
+        Handles both the current (no datetime) and future (datetime-prefixed)
+        layouts, and returns None for cycle headers / blanks / malformed rows.
+        """
+        line = line.strip()
+        if not line:
+            return None
+        parts = [p.strip() for p in line.split(";")]
+        # Detect datetime prefix: first token is an int only in the no-ts layout.
+        ts = None
+        try:
+            int(parts[0])
+            body = parts                      # current layout: inst; ID; d0..d7
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    ts = datetime.strptime(parts[0], fmt)
+                    break
+                except ValueError:
+                    pass
+            body = parts[1:]                  # future layout: drop the datetime
+        if len(body) < 10:
+            return None                       # cycle header / truncated line
+        try:
+            inst = int(body[0])
+            det = int(body[1])
+            data = [int(x) for x in body[2:10]]
+        except ValueError:
+            return None
+        return inst, det, ts, data
+
+    def _read_new_stats(self):
+        """Incrementally consume newly-appended bytes of the latest stats_log."""
+        path = self._latest_stats_log()
+        if path != self._stats_path:          # new run -> start fresh
+            self._stats_path = path
+            self._reset_stats_state()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return
+        if size < self._stats_offset:         # file shrank / rotated -> re-read
+            self._reset_stats_state()
+        if size == self._stats_offset:
+            return                            # nothing new
+
+        # Read in binary so byte offsets are exact on Windows, and only consume
+        # up to the last complete line (the writer may be mid-append).
+        with open(path, "rb") as f:
+            f.seek(self._stats_offset)
+            raw = f.read()
+        nl = raw.rfind(b"\n")
+        if nl == -1:
+            return                            # no complete line yet
+        self._stats_offset += nl + 1
+        text = raw[:nl + 1].decode("utf-8", errors="replace")
+
+        for line in text.splitlines():
+            parsed = self._parse_stats_line(line)
+            if not parsed:
+                continue
+            inst, det, ts, d = parsed
+            if inst == 98:                    # rate in: events / (deltaT/1000)
+                dt_ms = d[2]
+                if dt_ms > 0:
+                    ch0 = d[0] / (dt_ms / 1000.0)
+                    ch1 = d[1] / (dt_ms / 1000.0)
+                    self._stats_rate[det].append((ts, ch0, ch1, ch0 + ch1))
+            elif inst == 96:                  # integrity: (data+null)/req, unreas/req
+                req = d[0]
+                if req > 0:
+                    wifi = (d[1] + d[2]) / req
+                    unreas = d[3] / req
+                    self._stats_integ[det].append((ts, wifi, unreas))
+
+    def _det_label(self, det_id):
+        name = ID_TO_NAME.get(det_id)
+        return f"{name} ({det_id})" if name else str(det_id)
+
+    def _update_datactrl(self):
+        try:
+            self._read_new_stats()
+
+            # Keep the detector dropdown in sync with the ids we've seen.
+            ids = sorted(set(self._stats_rate) | set(self._stats_integ))
+            disp = [self._det_label(i) for i in ids]
+            self._data_disp_to_id = dict(zip(disp, ids))
+            if list(self.data_unit_combo["values"]) != disp:
+                self.data_unit_combo["values"] = disp
+                if self.data_unit_var.get() not in disp and disp:
+                    self.data_unit_var.set(disp[0])
+
+            sel_id = self._data_disp_to_id.get(self.data_unit_var.get())
+            used_time = False
+
+            # ---- Observed rate (top) ---------------------------------- #
+            self.data_ax_rate.clear()
+            self.data_ax_rate.set_title(
+                f"Observed rate — {self._det_label(sel_id)}" if sel_id is not None
+                else "Observed rate")
+            self.data_ax_rate.set_ylabel("Hz")
+            rate = list(self._stats_rate.get(sel_id, [])) if sel_id is not None else []
+            if rate:
+                xr, t_used = self._stats_x([r[0] for r in rate])
+                used_time |= t_used
+                self.data_ax_rate.plot(xr, [r[1] for r in rate], lw=1, label="Ch0")
+                self.data_ax_rate.plot(xr, [r[2] for r in rate], lw=1, label="Ch1")
+                self.data_ax_rate.plot(xr, [r[3] for r in rate], lw=1.4, color="k",
+                                       label="Total")
+                self.data_ax_rate.set_ylim(bottom=0)
+                self.data_ax_rate.legend(loc="upper left", fontsize=8, ncol=3)
+                self.data_ax_rate.grid(True, alpha=0.3)
+            else:
+                self._waiting_text(self.data_ax_rate)
+
+            # ---- Wifi integrity (bottom) ------------------------------ #
+            self.data_ax_integ.clear()
+            self.data_ax_integ.set_title("Wifi integrity & unreasonable requests")
+            self.data_ax_integ.set_ylabel("%")
+            integ = list(self._stats_integ.get(sel_id, [])) if sel_id is not None else []
+            if integ:
+                xi, t_used = self._stats_x([r[0] for r in integ])
+                used_time |= t_used
+                self.data_ax_integ.plot(xi, [r[1] * 100 for r in integ], lw=1.2,
+                                        color="#2980b9", label="Wifi integrity")
+                self.data_ax_integ.plot(xi, [r[2] * 100 for r in integ], lw=1,
+                                        color="#e74c3c", label="Unreasonable")
+                # Integrity sits near 100%; pad headroom so the line isn't clipped.
+                self.data_ax_integ.set_ylim(0, 110)
+                self.data_ax_integ.axhline(100, color="#aaa", lw=0.8, ls="--")
+                self.data_ax_integ.legend(loc="lower left", fontsize=8, ncol=2)
+                self.data_ax_integ.grid(True, alpha=0.3)
+            else:
+                self._waiting_text(self.data_ax_integ)
+
+            self.data_ax_integ.set_xlabel("time" if used_time else "sample")
+            if used_time:
+                self.data_fig.autofmt_xdate()
+            self.data_fig.tight_layout()
+            self.data_canvas.draw_idle()
+
+            # ---- Readout --------------------------------------------- #
+            last_r = rate[-1] if rate else None
+            last_i = integ[-1] if integ else None
+            self.data_stat_vars["Ch0 (Hz)"].set(f"{last_r[1]:.1f}" if last_r else "—")
+            self.data_stat_vars["Ch1 (Hz)"].set(f"{last_r[2]:.1f}" if last_r else "—")
+            self.data_stat_vars["Total (Hz)"].set(f"{last_r[3]:.1f}" if last_r else "—")
+            self.data_stat_vars["Wifi integrity"].set(f"{last_i[1] * 100:.1f}%" if last_i else "—")
+            self.data_stat_vars["Unreas %"].set(f"{last_i[2] * 100:.1f}%" if last_i else "—")
+        except Exception:
+            pass
+        finally:
+            self.root.after(3000, self._update_datactrl)
+
+    @staticmethod
+    def _stats_x(timestamps):
+        """Return (x_values, used_time).
+
+        Real datetimes if every row has one (future log format), else the
+        sample index (current format has no datetime column yet).
+        """
+        if timestamps and all(t is not None for t in timestamps):
+            return timestamps, True
+        return list(range(len(timestamps))), False
+
+    @staticmethod
+    def _waiting_text(ax):
+        ax.text(0.5, 0.5, "waiting for telemetry…", ha="center", va="center",
+                transform=ax.transAxes, color="#888")
 
     # ================================================================== #
     #  Tab 4 – Auto Survey (batch survey-in → auto-fix all devices)

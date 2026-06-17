@@ -87,7 +87,9 @@ class GPSDAQApp:
         self.root = root
         self.root.title("KoForce GUI")
         self.root.geometry("820x720")
-        self.root.resizable(True, True)
+        # Allow growing, but never shrink below the design size — otherwise tabs
+        # get clipped with no scrollbar to reach the hidden controls.
+        self.root.minsize(820, 720)
 
         self.server_process = None
         self.ota_process = None
@@ -251,12 +253,12 @@ class GPSDAQApp:
         # Parameters row
         tk.Label(surv, text="Min dur (s):").grid(row=0, column=0, sticky="w")
         self.svin_dur_entry = tk.Entry(surv, width=7)
-        self.svin_dur_entry.insert(0, "60")
+        self.svin_dur_entry.insert(0, "86400")
         self.svin_dur_entry.grid(row=0, column=1, padx=(2, 14), sticky="w")
 
         tk.Label(surv, text="Acc limit (0.1 mm):").grid(row=0, column=2, sticky="w")
         self.svin_acc_entry = tk.Entry(surv, width=8)
-        self.svin_acc_entry.insert(0, "3000")   # 300 mm default
+        self.svin_acc_entry.insert(0, "1000")   # 10 cm default
         self.svin_acc_entry.grid(row=0, column=3, padx=(2, 14), sticky="w")
 
         tk.Button(surv, text="Start Survey-In", width=16,
@@ -306,9 +308,10 @@ class GPSDAQApp:
             row=0, column=2, columnspan=2, padx=6, pady=(0, 8), sticky="w")
 
         # Editable input row (values to send)
-        tk.Label(fix, text="Set position  (X / Y / Z in cm, Acc in 0.1 mm):",
-                 font=("Arial", 8)).grid(row=1, column=0, columnspan=4, sticky="w")
-        self.fix_entries = self._make_coord_row(fix, row=2)
+        tk.Label(fix, text="Set position:", font=("Arial", 8)).grid(
+            row=1, column=0, columnspan=4, sticky="w")
+        self.fix_entries = self._make_coord_row(
+            fix, row=2, labels=["X (cm)", "Y (cm)", "Z (cm)", "Acc (0.1mm)"])
 
         # Read-only row (what the receiver currently reports)
         tk.Label(fix, text="Receiver reports:", font=("Arial", 8)).grid(
@@ -348,17 +351,24 @@ class GPSDAQApp:
         tk.Button(rcv, text="Set Rate", width=10,
                   command=self.set_rate).grid(row=1, column=3, sticky="w", pady=(6, 0))
 
-    def _make_coord_row(self, parent, row, bg=None):
-        """Helper: place x / y / z / Acc label+entry pairs and return the entry dict."""
+    def _make_coord_row(self, parent, row, bg=None, labels=None):
+        """Helper: place x / y / z / Acc label+entry pairs and return the entry dict.
+
+        Entry padding/centering matches the Survey-In and Receiver-reports rows
+        (padx=4, pady=2, no sticky) so the columns line up vertically.  `labels`
+        overrides the display text while the returned dict keeps the x/y/z/Acc keys.
+        """
         fields = ["x", "y", "z", "Acc"]
+        if labels is None:
+            labels = [f"{name}:" for name in fields]
         entries = {}
-        for col, name in enumerate(fields):
-            tk.Label(parent, text=f"{name}:").grid(row=row, column=col, sticky="s")
+        for col, (name, text) in enumerate(zip(fields, labels)):
+            tk.Label(parent, text=text, font=("Arial", 8)).grid(row=row, column=col, sticky="s")
             kw = {"width": 14}
             if bg:
                 kw["bg"] = bg
             e = tk.Entry(parent, **kw)
-            e.grid(row=row + 1, column=col, padx=4, pady=2, sticky="w")
+            e.grid(row=row + 1, column=col, padx=4, pady=2)
             entries[name] = e
         return entries
 
@@ -1048,8 +1058,7 @@ class GPSDAQApp:
             # ---- Observed rate (top) ---------------------------------- #
             self.data_ax_rate.clear()
             self.data_ax_rate.set_title(
-                f"Observed rate — {self._det_label(sel_id)}" if sel_id is not None
-                else "Observed rate")
+                f"Observed Rate")
             self.data_ax_rate.set_ylabel("Hz")
             rate = list(self._stats_rate.get(sel_id, [])) if sel_id is not None else []
             if rate:
@@ -1067,7 +1076,7 @@ class GPSDAQApp:
 
             # ---- Wifi integrity (bottom) ------------------------------ #
             self.data_ax_integ.clear()
-            self.data_ax_integ.set_title("Wifi integrity & unreasonable requests")
+            self.data_ax_integ.set_title("Wifi Integrity & Unreasonable Requests")
             self.data_ax_integ.set_ylabel("%")
             integ = list(self._stats_integ.get(sel_id, [])) if sel_id is not None else []
             if integ:
@@ -1076,7 +1085,7 @@ class GPSDAQApp:
                 self.data_ax_integ.plot(xi, [r[1] * 100 for r in integ], lw=1.2,
                                         color="#2980b9", label="Wifi integrity")
                 self.data_ax_integ.plot(xi, [r[2] * 100 for r in integ], lw=1,
-                                        color="#e74c3c", label="Unreasonable")
+                                        color="#e74c3c", label="Unreasonable Requests")
                 # Integrity sits near 100%; pad headroom so the line isn't clipped.
                 self.data_ax_integ.set_ylim(0, 110)
                 self.data_ax_integ.axhline(100, color="#aaa", lw=0.8, ls="--")
@@ -1693,32 +1702,42 @@ class GPSDAQApp:
         instr.pack(fill="x", padx=10, pady=(10, 4))
 
         self.ota_instructions = tk.Text(
-            instr, height=6, wrap="word", font=("Arial", 9),
+            instr, height=1, wrap="word", font=("Arial", 9),
             bg="#f7f7f7", relief="flat",
         )
         self.ota_instructions.insert(
             "1.0",
-            "OTA instructions go here.\n"
-            "(Reserved space — written guidance on how to push OTA updates "
-            "will be added later.)",
+            "Updating Main File:\n 1. Ensure new main.py is in ota directory and cd into it.\n 2. To send to all devices: python3 execute_ota.py.\n 3. To send to specific devices: python3 execute_ota.py 1 2 3)\n"
+            "Updating Accessory Files: \n 1. Ensure files are in the ota directory and cd into it.\n 2. To send to all devices: python3 execute_ota.py --file PPS.py \n 3. To send to specific devices: python3 execute_ota.py --file PPS.py 2 3 7\n"
+            "Version Probe:\n 1. To check the main.py version of all ESPs: python3 version_probe.py \n 2. To check the main.py version of specific ESPs: python3 version_probe.py 1 5 8 \n 3. To check another file's version: python3 version_probe.py --file PPS.py \n 4.To check another file's version on specific ESPs: python3 version_probe.py --file PPS.py 1 5 8 "
         )
         self.ota_instructions.config(state="disabled")
         self.ota_instructions.pack(fill="x")
 
+        # Auto-size the box to show every line, and re-fit on resize (word wrap
+        # means the number of display lines depends on the current width).
+        def _fit_ota_instructions(event=None):
+            n = self.ota_instructions.count("1.0", "end", "displaylines")
+            n = (n[0] if n else 0) or 1
+            if int(self.ota_instructions.cget("height")) != n:
+                self.ota_instructions.config(height=n)
+        self.ota_instructions.bind("<Configure>", _fit_ota_instructions)
+
         # ---- Interactive terminal ------------------------------------ #
         term = tk.LabelFrame(parent, text="OTA Terminal", padx=5, pady=5)
         term.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # Command input row — packed first with side="bottom" so it stays pinned
+        # to the bottom and is never squeezed off-screen when space is tight.
+        entry_row = tk.Frame(term)
+        entry_row.pack(side="bottom", fill="x", pady=(5, 0))
 
         self.ota_text = scrolledtext.ScrolledText(
             term, state="disabled",
             font=("Courier", 9), bg="#1e1e1e", fg="#d4d4d4",
             insertbackground="#d4d4d4",
         )
-        self.ota_text.pack(fill="both", expand=True)
-
-        # Command input row
-        entry_row = tk.Frame(term)
-        entry_row.pack(fill="x", pady=(5, 0))
+        self.ota_text.pack(side="top", fill="both", expand=True)
 
         tk.Label(entry_row, text=">").pack(side="left")
         self.ota_entry = tk.Entry(entry_row, font=("Courier", 9))

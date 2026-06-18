@@ -54,7 +54,7 @@ class CycleLimitReached(Exception):
 
 class RotatingFileWriter:
     def __init__(self, base_folder_name = "folder", base_file_name="file", ext=".txt", time_length = 10, gzip_files=False, header = "", max_cycles = 0):
-        self.base_data_storage_folder = "C:\\Users\\aclark2\\Desktop\\Claude_GUI_prac\\GPS Data"
+        self.base_data_storage_folder = "GPS Data"
         self.base_folder_name = base_folder_name
         self.base_file_name = base_file_name
         self.ext = ext
@@ -73,9 +73,15 @@ class RotatingFileWriter:
         self.device_log = os.path.join(self.folder_dir, "device_log.txt")
         self.cpu_log = os.path.join(self.folder_dir, "gps_cpu_log.txt")
         self.stats_log = os.path.join(self.folder_dir, "stats_log.txt")
-        with open(self.cpu_log, 'a') as f:
-            f.write("timestamp; ID; cpuLoad; cpuLoadMax; memUsage; memUsageMax; "
-                    "ioUsage; ioUsageMax; runTime_s; temp_C; notice; warn; error\n")
+        # Persistent, line-buffered handles for the high-rate telemetry logs.
+        # These are written from the hot select loop on every stats/CPU packet, so
+        # they are opened ONCE here rather than re-opened per message — re-opening
+        # per message throttled the loop and delayed BH broadcasts (stale TOIs ->
+        # "unreasonable" storms on the arrays). Line-buffered = flushed per line.
+        self.stats_file = open(self.stats_log, "a", buffering=1)
+        self.cpu_file = open(self.cpu_log, "a", buffering=1)
+        self.cpu_file.write("timestamp; ID; cpuLoad; cpuLoadMax; memUsage; memUsageMax; "
+                            "ioUsage; ioUsageMax; runTime_s; temp_C; notice; warn; error\n")
         self.open_new_file()
 
     def _get_next_run_number(self):
@@ -130,11 +136,9 @@ class RotatingFileWriter:
             cl.write(f"\nStart Cycle {self.cycle_number}:{datetime.now()}\n")
         with open(self.error_log, 'a') as el:
             el.write(f"\nStart Cycle {self.cycle_number}:{datetime.now()}\n")
-        with open(self.stats_log, 'a') as el:
-            el.write(f"\nStart Cycle {self.cycle_number}:{datetime.now()}\n")
+        self.stats_file.write(f"\nStart Cycle {self.cycle_number}:{datetime.now()}\n")
 
         self.cycle_number += 1
-        time.sleep(1)
 
 
 
@@ -159,6 +163,12 @@ class RotatingFileWriter:
     def close(self):
         if self.file:
             self._close_and_gzip()
+        for fh in (getattr(self, "stats_file", None), getattr(self, "cpu_file", None)):
+            try:
+                if fh:
+                    fh.close()
+            except Exception:
+                pass
 
 def cleanup_client_socket(sock, addr, sockets, clients, clients_by_id):
 
@@ -225,6 +235,7 @@ def run_server():
 
     print(f"[SERVER] Server listening on {HOST}:{PORT}")
     print(f"[SERVER] Control listening on {HOST}:{CTRL_PORT}")
+    
 
     sockets = [server, ctrl_server]  # includes all connected sockets
     clients = {}        # map client socket -> {'buffer': bytearray, 'id': int}
@@ -257,7 +268,6 @@ def run_server():
                 try:
                     client_socket, addr = server.accept()
                     client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                    time.sleep(0.1)
                     client_socket.setblocking(False)
                     sockets.append(client_socket)
                     clients[client_socket] = { #Dictionary of client raw data and addresses
@@ -278,7 +288,7 @@ def run_server():
                         with open(writer.error_log, 'a') as f:
                             f.write(f"[SERVER] Error accepting connection: {addr}; {e}\n")
                         continue
-
+                
             elif s is ctrl_server:  # New control connection (ESP or GUI)
                 try:
                     ctrl_socket, addr = ctrl_server.accept()
@@ -293,9 +303,10 @@ def run_server():
                     else:
                         print(f"[SERVER] Error accepting control connection: {e}")
                         continue
-
+                
             elif s in ctrl_clients:  # Slow-control traffic (survey/fix)
                 info = ctrl_clients.get(s)
+
                 caddr = info["addr"] if info else None
                 try:
                     data = s.recv(2048)
@@ -313,66 +324,66 @@ def run_server():
                 # Crash-proof: a bad packet or a momentarily-locked log file must
                 # never take down run_server (that would silently kill the control channel).
                 try:
-                  while len(info["buffer"]) >= PACKET_SIZE:
-                    packet = info["buffer"][:PACKET_SIZE]
-                    info["buffer"] = info["buffer"][PACKET_SIZE:]
-                    inst, ID, RF, Cal, ch, w_num, ms, sub_ms, event_num, count = struct.unpack(PACKET_FORMAT, packet)
+                    while len(info["buffer"]) >= PACKET_SIZE:
+                        packet = info["buffer"][:PACKET_SIZE]
+                        info["buffer"] = info["buffer"][PACKET_SIZE:]
+                        inst, ID, RF, Cal, ch, w_num, ms, sub_ms, event_num, count = struct.unpack(PACKET_FORMAT, packet)
 
-                    # An ESP registers its control socket by mac_id (sends a hello on connect)
-                    if ID != GUI_ID:
-                        ctrl_by_id[ID] = s
-                        info["id"] = ID
+                        # An ESP registers its control socket by mac_id (sends a hello on connect)
+                        if ID != GUI_ID:
+                            ctrl_by_id[ID] = s
+                            info["id"] = ID
 
-                    if inst in (201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211):
-                        if ID == GUI_ID:
-                            # Command from GUI -> forward to the target ESP's control socket
-                            target_id   = RF
-                            target_sock = ctrl_by_id.get(target_id)
-                            if target_sock:
-                                if inst in (201, 204, 206, 208, 209, 211):  # status/probe/read/version/TP1-read/posllh: expect a reply
-                                    pending_slow_ctrl[target_id] = s
-                                    fwd = struct.pack(BCAST_FORMAT, inst, 0, 0, 0, 0)
-                                else:                     # 202/203/205/207/210 carry parameters
-                                    fwd = struct.pack(BCAST_FORMAT, inst, w_num, ms, sub_ms, event_num)
-                                try:
-                                    target_sock.sendall(fwd)
-                                    print(f"[SERVER] ctrl inst={inst} forwarded to ESP {target_id}")
-                                except OSError:
-                                    t_info = ctrl_clients.get(target_sock)
-                                    t_addr = t_info["addr"] if t_info else "Unknown"
-                                    cleanup_ctrl_socket(target_sock, t_addr, sockets, ctrl_clients, ctrl_by_id, pending_slow_ctrl)
-                            else:
-                                print(f"[SERVER] ctrl inst={inst}: ESP {target_id} not connected")
-                                with open(writer.error_log, 'a') as f:
-                                    f.write(f"ctrl inst={inst}: ESP {target_id} not connected\n")
-                        else:
-                            # Reply / confirmation from an ESP
-                            writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                            if inst in (201, 204, 206, 208, 209, 211):
-                                gui_sock = pending_slow_ctrl.pop(ID, None)
-                                if gui_sock and gui_sock in sockets:
-                                    response = struct.pack(PACKET_FORMAT, inst, ID, RF, Cal, ch, w_num, ms, sub_ms, event_num, count)
+                        if inst in (201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211):
+                            if ID == GUI_ID:
+                                # Command from GUI -> forward to the target ESP's control socket
+                                target_id   = RF
+                                target_sock = ctrl_by_id.get(target_id)
+                                if target_sock:
+                                    if inst in (201, 204, 206, 208, 209, 211):  # status/probe/read/version/TP1-read/posllh: expect a reply
+                                        pending_slow_ctrl[target_id] = s
+                                        fwd = struct.pack(BCAST_FORMAT, inst, 0, 0, 0, 0)
+                                    else:                     # 202/203/205/207/210 carry parameters
+                                        fwd = struct.pack(BCAST_FORMAT, inst, w_num, ms, sub_ms, event_num)
                                     try:
-                                        gui_sock.sendall(response)
+                                        target_sock.sendall(fwd)
+                                        print(f"[SERVER] ctrl inst={inst} forwarded to ESP {target_id}")
                                     except OSError:
-                                        pass
+                                        t_info = ctrl_clients.get(target_sock)
+                                        t_addr = t_info["addr"] if t_info else "Unknown"
+                                        cleanup_ctrl_socket(target_sock, t_addr, sockets, ctrl_clients, ctrl_by_id, pending_slow_ctrl)
+                                else:
+                                    print(f"[SERVER] ctrl inst={inst}: ESP {target_id} not connected")
+                                    with open(writer.error_log, 'a') as f:
+                                        f.write(f"ctrl inst={inst}: ESP {target_id} not connected\n")
+                            else:
+                                # Reply / confirmation from an ESP
+                                writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                                if inst in (201, 204, 206, 208, 209, 211):
+                                    gui_sock = pending_slow_ctrl.pop(ID, None)
+                                    if gui_sock and gui_sock in sockets:
+                                        response = struct.pack(PACKET_FORMAT, inst, ID, RF, Cal, ch, w_num, ms, sub_ms, event_num, count)
+                                        try:
+                                            gui_sock.sendall(response)
+                                        except OSError:
+                                            pass
 
-                    elif inst == 91:  # GPS health counts (sent right before inst=90)
-                        cpu_extra[ID] = (RF, Cal, ch)   # notice, warn, error
-                    elif inst == 90:  # autonomous GPS CPU/health telemetry from an ESP
-                        # RF=cpuLoad Cal=memUsage ch=ioUsage w_num=temp
-                        # ms=cpuLoadMax sub_ms=memUsageMax event_num=ioUsageMax count=runTime
-                        notice, warn, error = cpu_extra.get(ID, (0, 0, 0))
-                        try:
-                            with open(writer.cpu_log, 'a') as f:
+                        elif inst == 91:  # GPS health counts (sent right before inst=90)
+                            cpu_extra[ID] = (RF, Cal, ch)   # notice, warn, error
+                        elif inst == 90:  # autonomous GPS CPU/health telemetry from an ESP
+                            # RF=cpuLoad Cal=memUsage ch=ioUsage w_num=temp
+                            # ms=cpuLoadMax sub_ms=memUsageMax event_num=ioUsageMax count=runTime
+                            notice, warn, error = cpu_extra.get(ID, (0, 0, 0))
+                            try:
                                 # cols: ts; ID; cpuLoad; cpuLoadMax; memUsage; memUsageMax; ioUsage; ioUsageMax; runTime; temp; notice; warn; error
-                                f.write(f"{datetime.now()}; {ID}; {RF}; {ms}; {Cal}; {sub_ms}; "
-                                        f"{ch}; {event_num}; {count}; {w_num}; {notice}; {warn}; {error}\n")
-                        except OSError as e:
-                            print(f"[SERVER] cpu_log write skipped: {e}")
+                                writer.cpu_file.write(f"{datetime.now()}; {ID}; {RF}; {ms}; {Cal}; {sub_ms}; "
+                                                    f"{ch}; {event_num}; {count}; {w_num}; {notice}; {warn}; {error}\n")
+                            except Exception as e:
+                                print(f"[SERVER] cpu_log write skipped: {e}")
                 except Exception as e:
                     print(f"[SERVER] ctrl handler error (packet dropped): {e}")
                     info["buffer"] = bytearray()
+                
 
             else: #Reads client data
                 client_info = clients.get(s)
@@ -401,7 +412,8 @@ def run_server():
 
                         cleanup_client_socket(s, client_addr, sockets, clients, clients_by_id)
                         continue
-
+                
+                
                 client_info["buffer"].extend(data)
                 # Packet buffer to handle multiple packets at the same time
                 while len(client_info["buffer"]) >= PACKET_SIZE:
@@ -410,7 +422,7 @@ def run_server():
 
                     #Unpacks data
                     inst, ID, RF, Cal, ch, w_num, ms, sub_ms, event_num, count = struct.unpack(PACKET_FORMAT, packet)
-                    
+
                     if client_info.get("id") != ID:
                         existing_sock = clients_by_id.get(ID)
 
@@ -441,37 +453,23 @@ def run_server():
                             f.write(f"[ESP]:{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n") # Ignore labels; RF = Error Code
 
                     elif inst in (93, 94, 95, 96, 97, 98):
-                        ###
-
-                        if inst == 97:
-                            if ID == 48:
-                                try:
-                                    event_num = prev_event_num_BH 
-                                    #writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                                    with open(writer.stats_log, 'a') as log:
-                                        log.write(f"{datetime.now()}; {inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-
-                                    #gps_to_utc = gps_to_utc_seconds(w_num, ms, sub_ms)
-                                    #print("BH transit time:", (time.time()-gps_to_utc)*1000)
-                                except Exception:
-                                    pass
-
-                            elif ID == 16:
-                                try:
-                                    event_num = event_num_veto #I think this must be due to how the code is on the esp
-                                    with open(writer.stats_log, 'a') as log:
-                                        log.write(f"{datetime.now()}; {inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                                    #writer.write(f"{inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                                except Exception:
-                                    pass
-                    
-                            else:
-                                with open(writer.stats_log, 'a') as log:
-                                    log.write(f"{datetime.now()}; {inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
-                  
-                        else:
-                            with open(writer.stats_log, 'a') as log:
-                                log.write(f"{datetime.now()}; {inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                        # High-rate telemetry -> persistent stats_file handle (NOT a
+                        # per-message open(); that throttled the select loop and delayed
+                        # the BH timestamp broadcast, producing stale TOIs / "unreasonable"
+                        # storms on the arrays). Whole block guarded so a transient I/O
+                        # error or an unbound prev_event_num_BH can't break the loop.
+                        
+                        try:
+                            if inst == 93:
+                                print(f"UR request from {ID}")
+                            if inst == 97:
+                                if ID == 48:
+                                    event_num = prev_event_num_BH
+                                elif ID == 16:
+                                    event_num = event_num_veto  # quirk of the esp-side code
+                            writer.stats_file.write(f"{datetime.now()}; {inst}; {ID}; {RF}; {Cal}; {ch}; {w_num}; {ms}; {sub_ms}; {event_num}; {count}\n")
+                        except Exception:
+                            pass
 
                     elif inst == 99: #Data Code
                         '''
@@ -481,7 +479,7 @@ def run_server():
                                 f.write(f"{str(ID)}\n")
                         '''
 
-                        if ID == 164:
+                        if ID == 128:
                             
                             if ch == 0 and RF == 0: #Measuring time from rise  
                                 event_num = event_num_BH
@@ -492,17 +490,13 @@ def run_server():
 
                                 rise_BH_timestamp = ns_timestamp(ms, sub_ms)
 
-
                                 for client_ID in list(clients_by_id.keys()):
 
-                                    if client_ID not in (164, 16, GUI_ID):
+                                    if client_ID not in (128, 16, GUI_ID):
                                         client_sock = clients_by_id.get(client_ID)
 
                                         if client_sock is None:
                                             continue
-
-                                        client_info = clients.get(client_sock)
-                                        client_addr = client_info["addr"] if client_info else "Unknown"
 
                                         try:
                                             broadcast_packet = struct.pack(BCAST_FORMAT, inst, w_num, ms, sub_ms, event_num)
@@ -514,11 +508,14 @@ def run_server():
                                                 continue
 
                                             else:  # ECONNRESET or other fatal error
-                                                print(f"[SERVER] Send Error to {client_addr}: {e}")
+                                                #Tells us which address the data is sent to
+                                                target_info = clients.get(client_sock) 
+                                                target_addr = target_info["addr"] if target_info else "Unknown"
+                                                print(f"[SERVER] Send Error to {target_addr}: {e}")
                                                 with open(writer.error_log, 'a') as f:
-                                                    f.write(f"[SERVER] Send Error to {client_addr}: {e}\n")
+                                                    f.write(f"[SERVER] Send Error to {target_addr}: {e}\n")
 
-                                                cleanup_client_socket(client_sock, client_addr, sockets, clients, clients_by_id)
+                                                cleanup_client_socket(client_sock, target_addr, sockets, clients, clients_by_id)
 
                                                 continue
 
@@ -560,24 +557,23 @@ def run_server():
                                         if client_sock is None:
                                             continue
 
-                                        client_info = clients.get(client_sock)
-                                        client_addr = client_info["addr"] if client_info else "Unknown"
-
                                         try:
                                             broadcast_packet = struct.pack(BCAST_FORMAT, inst, w_num, ms, sub_ms, event_num)
                                             client_sock.sendall(broadcast_packet)
 
                                         except OSError as e:
                                             if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                                                # Error can be skipped
                                                 continue
 
                                             else:  # ECONNRESET or other fatal error
-                                                print(f"[SERVER] Send Error to {client_addr}: {e}")
+                                                #Tells us which address the data is sent to
+                                                target_info = clients.get(client_sock) 
+                                                target_addr = target_info["addr"] if target_info else "Unknown"
+                                                print(f"[SERVER] Send Error to {target_addr}: {e}")
                                                 with open(writer.error_log, 'a') as f:
-                                                    f.write(f"[SERVER] Send Error to {client_addr}: {e}\n")
+                                                    f.write(f"[SERVER] Send Error to {target_addr}: {e}\n")
 
-                                                cleanup_client_socket(client_sock, client_addr, sockets, clients, clients_by_id)
+                                                cleanup_client_socket(client_sock, target_addr, sockets, clients, clients_by_id)
 
                                                 continue
 
